@@ -56,6 +56,7 @@ pub(crate) async fn call_model<F>(
     config: &LlmConfig,
     messages: Vec<async_openai::types::chat::ChatCompletionRequestMessage>,
     enable_tools: bool,
+    enable_shell: bool,
     mut on_text: F,
 ) -> Result<LlmReply>
 where
@@ -72,7 +73,7 @@ where
     });
 
     if enable_tools {
-        request.tools(vec![shell_tool_definition()]);
+        request.tools(tool_definitions(enable_shell));
         request.parallel_tool_calls(false);
     }
 
@@ -135,6 +136,21 @@ where
     })
 }
 
+fn tool_definitions(enable_shell: bool) -> Vec<ChatCompletionTools> {
+    let mut tools = vec![
+        theorem_graph_push_tool_definition(),
+        theorem_graph_list_tool_definition(),
+        theorem_graph_list_deps_tool_definition(),
+        theorem_graph_examine_tool_definition(),
+        theorem_graph_review_tool_definition(),
+        theorem_graph_revise_tool_definition(),
+    ];
+    if enable_shell {
+        tools.push(shell_tool_definition());
+    }
+    tools
+}
+
 fn shell_tool_definition() -> ChatCompletionTools {
     ChatCompletionTools::Function(ChatCompletionTool {
         function: FunctionObject {
@@ -157,6 +173,153 @@ fn shell_tool_definition() -> ChatCompletionTools {
                     }
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            })),
+            strict: Some(true),
+        },
+    })
+}
+
+fn theorem_graph_push_tool_definition() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "theorem_graph_push".to_string(),
+            description: Some(
+                "Add a new theorem-graph entry. Use type=context for important facts supplied by the user or obtained from files, web search, or other external resources; in that case the proof should record the source or provenance. Use type=theorem only for important lemmas or theorems you have deduced yourself.".to_string(),
+            ),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["context", "theorem"],
+                        "description": "Whether this entry is prior context or a theorem established during the current exploration."
+                    },
+                    "statement": {
+                        "type": "string",
+                        "description": "The exact mathematical statement."
+                    },
+                    "proof": {
+                        "type": "string",
+                        "description": "A rigorous proof, or a reference note when the entry is context."
+                    },
+                    "dependencies": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 0},
+                        "description": "Direct dependency ids in the theorem graph."
+                    }
+                },
+                "required": ["type", "statement", "proof", "dependencies"],
+                "additionalProperties": false
+            })),
+            strict: Some(true),
+        },
+    })
+}
+
+fn theorem_graph_list_tool_definition() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "theorem_graph_list".to_string(),
+            description: Some(
+                "List theorem-graph entries in an id range, including statements, dependencies, and reviewer comments when present.".to_string(),
+            ),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "start": {"type": "integer", "minimum": 0},
+                    "end": {"type": "integer", "minimum": 0}
+                },
+                "required": ["start", "end"],
+                "additionalProperties": false
+            })),
+            strict: Some(true),
+        },
+    })
+}
+
+fn theorem_graph_list_deps_tool_definition() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "theorem_graph_list_deps".to_string(),
+            description: Some(
+                "Show a theorem entry together with its direct dependencies, including dependency statements, dependency links, review counts, and comments.".to_string(),
+            ),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "minimum": 0}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            })),
+            strict: Some(true),
+        },
+    })
+}
+
+fn theorem_graph_examine_tool_definition() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "theorem_graph_examine".to_string(),
+            description: Some(
+                "Inspect one theorem-graph entry in full detail, including proof text, dependencies, derivations, reviews, and comments.".to_string(),
+            ),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "minimum": 0}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            })),
+            strict: Some(true),
+        },
+    })
+}
+
+fn theorem_graph_review_tool_definition() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "theorem_graph_review".to_string(),
+            description: Some(
+                "Run the theorem-graph review routine on a theorem and its dependencies, updating review counts and flaw markers.".to_string(),
+            ),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "minimum": 0}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            })),
+            strict: Some(true),
+        },
+    })
+}
+
+fn theorem_graph_revise_tool_definition() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "theorem_graph_revise".to_string(),
+            description: Some(
+                "Revise the proof and direct dependencies of an existing theorem-graph entry after a flaw has been identified.".to_string(),
+            ),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "minimum": 0},
+                    "proof": {
+                        "type": "string",
+                        "description": "The corrected proof text."
+                    },
+                    "dependencies": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 0},
+                        "description": "The corrected direct dependency ids."
+                    }
+                },
+                "required": ["id", "proof", "dependencies"],
                 "additionalProperties": false
             })),
             strict: Some(true),

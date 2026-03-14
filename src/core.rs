@@ -19,6 +19,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use theorem_graph::TheoremEntryType;
 use ui::{
     COLOR_BLUE, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_GREEN, COLOR_RED, COLOR_YELLOW,
     editor_prompt, print_statusline, print_tool_call, print_tool_result, prompt_for_approval,
@@ -68,6 +69,13 @@ struct Cli {
 
     #[arg(
         long,
+        default_value_t = 12,
+        help = "Minimum reviews required on theorem dependencies before claiming a final result"
+    )]
+    reviews: u32,
+
+    #[arg(
+        long,
         global = true,
         value_name = "FILE",
         help = "Path to the session log file; relative paths are resolved from the current workspace"
@@ -91,6 +99,23 @@ enum CliCommand {
             help = "Resume the most recent matching session without prompting"
         )]
         last: bool,
+    },
+    /// View theorem-graph contents from a saved session log.
+    View {
+        #[arg(long, help = "Use the most recent session for this workspace")]
+        last: bool,
+        #[arg(
+            long,
+            conflicts_with = "path_to",
+            help = "Print one theorem entry by id"
+        )]
+        id: Option<usize>,
+        #[arg(
+            long = "path-to",
+            conflicts_with = "id",
+            help = "Print one theorem entry and all of its dependencies"
+        )]
+        path_to: Option<usize>,
     },
 }
 
@@ -117,6 +142,7 @@ impl From<CliReasoningEffort> for ReasoningEffort {
 struct Config {
     llm: LlmConfig,
     history_token_limit: u64,
+    minimal_reviews: u32,
     workspace_root: PathBuf,
     enable_shell: bool,
 }
@@ -161,9 +187,40 @@ struct ShellToolArgs {
     workdir: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TheoremGraphPushArgs {
+    #[serde(rename = "type")]
+    entry_type: TheoremEntryType,
+    statement: String,
+    proof: String,
+    dependencies: Vec<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TheoremGraphListArgs {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct TheoremGraphIdArgs {
+    id: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct TheoremGraphReviseArgs {
+    id: usize,
+    proof: String,
+    dependencies: Vec<usize>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    App::load(Cli::parse()).await?.run().await
+    let cli = Cli::parse();
+    if let Some(CliCommand::View { .. }) = &cli.command {
+        return run_view(&cli);
+    }
+    App::load(cli).await?.run().await
 }
 
 impl App {
@@ -177,6 +234,7 @@ impl App {
         let resume = match cli.command {
             Some(CliCommand::Resume { last: true }) => ResumeMode::Last,
             Some(CliCommand::Resume { last: false }) => ResumeMode::Select,
+            Some(CliCommand::View { .. }) => ResumeMode::New,
             None => ResumeMode::New,
         };
 
@@ -194,6 +252,7 @@ impl App {
                 reasoning_effort: cli.reasoning_effort.into(),
             },
             history_token_limit,
+            minimal_reviews: cli.reviews,
             workspace_root: workspace_root.clone(),
             enable_shell: cli.enable_shell,
         };
@@ -226,6 +285,11 @@ impl App {
             "{} {}",
             style(COLOR_DIM, "history token limit:"),
             self.config.history_token_limit
+        );
+        println!(
+            "{} {}",
+            style(COLOR_DIM, "minimal reviews:"),
+            self.config.minimal_reviews
         );
         println!(
             "{} {}",
@@ -349,12 +413,14 @@ impl App {
                 &self.config.workspace_root,
                 &self.history.entries,
                 self.config.enable_shell,
+                self.config.minimal_reviews,
             );
             let mut started_stream = false;
             let reply = match call_model(
                 &self.client,
                 &self.config.llm,
                 messages,
+                true,
                 self.config.enable_shell,
                 |chunk| {
                     if !started_stream {
@@ -426,8 +492,21 @@ impl App {
             None
         };
         self.history.push_user(self.history.compaction_prompt(mode));
-        let messages = build_messages(&self.config.workspace_root, &self.history.entries, false);
-        let reply = match call_model(&self.client, &self.config.llm, messages, false, |_| {}).await
+        let messages = build_messages(
+            &self.config.workspace_root,
+            &self.history.entries,
+            false,
+            self.config.minimal_reviews,
+        );
+        let reply = match call_model(
+            &self.client,
+            &self.config.llm,
+            messages,
+            false,
+            false,
+            |_| {},
+        )
+        .await
         {
             Ok(reply) => reply,
             Err(err) => {
@@ -443,33 +522,98 @@ impl App {
 
     fn handle_tool_calls(&mut self, tool_calls: Vec<ToolCall>) -> Result<()> {
         for tool_call in tool_calls {
-            match tool_call.name.as_str() {
+            let (success, content) = match tool_call.name.as_str() {
                 "shell_tool" => {
                     if !self.config.enable_shell {
-                        let content = "shell_tool is disabled for this session; restart with --enable-shell to allow workspace commands".to_string();
-                        print_tool_result(&content, false);
-                        self.history
-                            .push_tool(tool_call.id, tool_call.name, content);
-                        continue;
+                        (
+                            false,
+                            "shell_tool is disabled for this session; restart with --enable-shell to allow workspace commands".to_string(),
+                        )
+                    } else {
+                        match parse_shell_tool_args(&tool_call)
+                            .and_then(|request| self.run_shell(request))
+                        {
+                            Ok(outcome) => (outcome.success, outcome.tool_content),
+                            Err(err) => (false, format!("tool error: {err:#}")),
+                        }
                     }
-                    let request = parse_shell_tool_args(&tool_call)?;
-                    let outcome = self.run_shell(request)?;
-                    print_tool_result(
-                        &normalize_tool_content_for_display(&outcome.tool_content),
-                        outcome.success,
-                    );
-                    self.history
-                        .push_tool(tool_call.id, tool_call.name, outcome.tool_content);
                 }
-                other => {
-                    let content = format!("unsupported tool: {other}");
-                    print_tool_result(&content, false);
-                    self.history
-                        .push_tool(tool_call.id, tool_call.name, content);
+                "theorem_graph_push" => match self.handle_theorem_graph_push(&tool_call) {
+                    Ok(content) => (true, content),
+                    Err(err) => (false, format!("tool error: {err:#}")),
+                },
+                "theorem_graph_list" => match self.handle_theorem_graph_list(&tool_call) {
+                    Ok(content) => (true, content),
+                    Err(err) => (false, format!("tool error: {err:#}")),
+                },
+                "theorem_graph_list_deps" => {
+                    match self.handle_theorem_graph_list_deps(&tool_call) {
+                        Ok(content) => (true, content),
+                        Err(err) => (false, format!("tool error: {err:#}")),
+                    }
                 }
-            }
+                "theorem_graph_examine" => match self.handle_theorem_graph_examine(&tool_call) {
+                    Ok(content) => (true, content),
+                    Err(err) => (false, format!("tool error: {err:#}")),
+                },
+                "theorem_graph_review" => match self.handle_theorem_graph_review(&tool_call) {
+                    Ok(content) => (true, content),
+                    Err(err) => (false, format!("tool error: {err:#}")),
+                },
+                "theorem_graph_revise" => match self.handle_theorem_graph_revise(&tool_call) {
+                    Ok(content) => (true, content),
+                    Err(err) => (false, format!("tool error: {err:#}")),
+                },
+                other => (false, format!("unsupported tool: {other}")),
+            };
+
+            let display = if tool_call.name == "shell_tool" {
+                normalize_tool_content_for_display(&content)
+            } else {
+                content.clone()
+            };
+            print_tool_result(&display, success);
+            self.history
+                .push_tool(tool_call.id, tool_call.name, content);
         }
         Ok(())
+    }
+
+    fn handle_theorem_graph_push(&mut self, tool_call: &ToolCall) -> Result<String> {
+        let args: TheoremGraphPushArgs = parse_tool_args(tool_call)?;
+        self.history.theorem_graph.push(
+            args.entry_type,
+            args.statement,
+            args.proof,
+            args.dependencies,
+        )
+    }
+
+    fn handle_theorem_graph_list(&mut self, tool_call: &ToolCall) -> Result<String> {
+        let args: TheoremGraphListArgs = parse_tool_args(tool_call)?;
+        self.history.theorem_graph.list(args.start, args.end)
+    }
+
+    fn handle_theorem_graph_list_deps(&mut self, tool_call: &ToolCall) -> Result<String> {
+        let args: TheoremGraphIdArgs = parse_tool_args(tool_call)?;
+        self.history.theorem_graph.list_deps(args.id)
+    }
+
+    fn handle_theorem_graph_examine(&mut self, tool_call: &ToolCall) -> Result<String> {
+        let args: TheoremGraphIdArgs = parse_tool_args(tool_call)?;
+        self.history.theorem_graph.examine(args.id)
+    }
+
+    fn handle_theorem_graph_review(&mut self, tool_call: &ToolCall) -> Result<String> {
+        let args: TheoremGraphIdArgs = parse_tool_args(tool_call)?;
+        self.history.theorem_graph.review(args.id)
+    }
+
+    fn handle_theorem_graph_revise(&mut self, tool_call: &ToolCall) -> Result<String> {
+        let args: TheoremGraphReviseArgs = parse_tool_args(tool_call)?;
+        self.history
+            .theorem_graph
+            .revise(args.id, args.proof, args.dependencies)
     }
 
     fn run_shell(&mut self, request: ShellRequest) -> Result<CommandOutcome> {
@@ -586,12 +730,7 @@ impl App {
 }
 
 fn parse_shell_tool_args(tool_call: &ToolCall) -> Result<ShellRequest> {
-    let args: ShellToolArgs = serde_json::from_str(&tool_call.arguments).with_context(|| {
-        format!(
-            "failed to decode arguments for tool {}: {}",
-            tool_call.name, tool_call.arguments
-        )
-    })?;
+    let args: ShellToolArgs = parse_tool_args(tool_call)?;
     let command = args.command.trim().to_string();
     if command.is_empty() {
         bail!("shell_tool requires a non-empty command");
@@ -602,6 +741,18 @@ fn parse_shell_tool_args(tool_call: &ToolCall) -> Result<ShellRequest> {
             .workdir
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+    })
+}
+
+fn parse_tool_args<T>(tool_call: &ToolCall) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_str(&tool_call.arguments).with_context(|| {
+        format!(
+            "failed to decode arguments for tool {}: {}",
+            tool_call.name, tool_call.arguments
+        )
     })
 }
 
@@ -801,6 +952,47 @@ fn load_session_file(path: &Path, workspace_root: &Path) -> Result<HistoryFile> 
         );
     }
     Ok(history)
+}
+
+fn load_history_from_path(path: &Path) -> Result<HistoryFile> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read session log {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("failed to decode session log {}", path.display()))
+}
+
+fn run_view(cli: &Cli) -> Result<()> {
+    let workspace_root = env::current_dir().context("failed to determine current directory")?;
+    let explicit_log_path = resolve_log_path(&workspace_root, cli.log_path.clone())?;
+    let CliCommand::View { last, id, path_to } = cli
+        .command
+        .as_ref()
+        .ok_or_else(|| anyhow!("view command missing"))?
+    else {
+        bail!("view command missing");
+    };
+
+    let history = match (explicit_log_path.as_deref(), *last) {
+        (Some(path), false) | (Some(path), true) => load_history_from_path(path)?,
+        (None, true) => {
+            let session = list_sessions(&workspace_root)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no previous sessions found for this workspace"))?;
+            load_history_from_path(&session.path)?
+        }
+        (None, false) => bail!("view requires --log-path <FILE> or --last"),
+    };
+
+    let output = match (id, path_to) {
+        (Some(id), None) => history.theorem_graph.examine(*id)?,
+        (None, Some(id)) => history.theorem_graph.path_to(*id)?,
+        (None, None) => bail!("view requires exactly one of --id or --path-to"),
+        (Some(_), Some(_)) => bail!("view accepts only one of --id or --path-to"),
+    };
+
+    println!("{output}");
+    Ok(())
 }
 
 fn resolve_log_path(workspace_root: &Path, path: Option<PathBuf>) -> Result<Option<PathBuf>> {

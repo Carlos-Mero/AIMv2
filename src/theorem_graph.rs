@@ -106,14 +106,23 @@ impl TheoremGraph {
         Ok(format_entry_full(self.entry(id)?))
     }
 
+    pub(crate) fn path_to(&self, id: usize) -> Result<String> {
+        let ids = self.review_scope(id)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for theorem_id in ids {
+            out.push(format_entry_full(self.entry(theorem_id)?));
+        }
+        Ok(out.join("\n\n"))
+    }
+
     pub(crate) fn review(&mut self, id: usize) -> Result<String> {
         let review_order = self.review_scope(id)?;
         let mut reviewed = Vec::new();
         for theorem_id in review_order {
-            let (passed, comments) = self.review_entry(theorem_id)?;
+            let (passed, comments, review_count) = self.review_entry(theorem_id)?;
             {
                 let entry = self.entry_mut(theorem_id)?;
-                entry.reviews = entry.reviews.saturating_add(1);
+                entry.reviews = entry.reviews.saturating_add(review_count);
                 if passed {
                     entry.comments = None;
                     reviewed.push(theorem_id);
@@ -217,9 +226,12 @@ impl TheoremGraph {
         }
     }
 
-    fn review_entry(&self, id: usize) -> Result<(bool, Option<String>)> {
-        let _entry = self.entry(id)?;
-        Ok((true, None))
+    fn review_entry(&self, id: usize) -> Result<(bool, Option<String>, u32)> {
+        let entry = self.entry(id)?;
+        match entry.entry_type {
+            TheoremEntryType::Context => Ok((true, None, 0)),
+            TheoremEntryType::Theorem => Ok((true, None, 1)),
+        }
     }
 
     fn validate_new_dependencies(
@@ -271,6 +283,7 @@ fn format_entry_summary(entry: &TheoremEntry) -> String {
 fn format_dependency_summary(entry: &TheoremEntry) -> String {
     let mut lines = vec![
         format!("id: {}", entry.id),
+        format!("type: {}", format_entry_type(&entry.entry_type)),
         format!("statement: {}", entry.statement),
         format!("dependencies: {:?}", entry.dependencies),
         format!("reviews: {}", entry.reviews),
