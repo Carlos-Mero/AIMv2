@@ -1,3 +1,4 @@
+use crate::theorem_graph::TheoremGraph;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
@@ -27,6 +28,8 @@ pub(crate) struct HistoryFile {
     pub(crate) total_output_tokens: u64,
     #[serde(default)]
     pub(crate) total_tokens: u64,
+    #[serde(default)]
+    pub(crate) theorem_graph: TheoremGraph,
     pub(crate) entries: Vec<HistoryEntry>,
 }
 

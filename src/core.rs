@@ -1,5 +1,6 @@
 mod history;
 mod llm;
+mod theorem_graph;
 mod ui;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -671,13 +672,14 @@ fn load_or_create_session(
     match resume {
         ResumeMode::New => {
             let history = HistoryFile {
-                version: 5,
+                version: 6,
                 session_id: format!("session-{}-{}", now_millis(), std::process::id()),
                 workspace_root: workspace_root.display().to_string(),
                 last_active_at_ms: now_millis(),
                 total_input_tokens: 0,
                 total_output_tokens: 0,
                 total_tokens: 0,
+                theorem_graph: theorem_graph::TheoremGraph::default(),
                 entries: Vec::new(),
             };
             let path = match explicit_log_path {
