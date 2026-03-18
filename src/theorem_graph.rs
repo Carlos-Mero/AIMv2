@@ -104,11 +104,24 @@ impl TheoremGraph {
         Ok(format_entry_full(self.entry(id)?))
     }
 
+    pub(crate) fn examine_markdown(&self, id: usize) -> Result<String> {
+        Ok(format_entry_markdown(self.entry(id)?))
+    }
+
     pub(crate) fn path_to(&self, id: usize) -> Result<String> {
         let ids = self.path_scope(id)?;
         let mut out = Vec::with_capacity(ids.len());
         for theorem_id in ids {
             out.push(format_entry_full(self.entry(theorem_id)?));
+        }
+        Ok(out.join("\n\n"))
+    }
+
+    pub(crate) fn path_to_markdown(&self, id: usize) -> Result<String> {
+        let ids = self.path_scope(id)?;
+        let mut out = vec![format!("# Theorem Path {id}")];
+        for theorem_id in ids {
+            out.push(format_entry_markdown(self.entry(theorem_id)?));
         }
         Ok(out.join("\n\n"))
     }
@@ -274,6 +287,33 @@ fn format_entry_type(entry_type: &TheoremEntryType) -> &'static str {
         TheoremEntryType::Context => "context",
         TheoremEntryType::Theorem => "theorem",
     }
+}
+
+fn format_entry_markdown(entry: &TheoremEntry) -> String {
+    let comments = entry.comments.as_deref().unwrap_or("None");
+    format!(
+        concat!(
+            "## Entry {}\n\n",
+            "- Type: `{}`\n",
+            "- Dependencies: `{:?}`\n",
+            "- Derivations: `{:?}`\n",
+            "- Reviews: `{}`\n\n",
+            "### Statement\n\n",
+            "{}\n\n",
+            "### Proof\n\n",
+            "```text\n{}\n```\n\n",
+            "### Comments\n\n",
+            "```text\n{}\n```"
+        ),
+        entry.id,
+        format_entry_type(&entry.entry_type),
+        entry.dependencies,
+        entry.derivations,
+        entry.reviews,
+        entry.statement,
+        entry.proof,
+        comments
+    )
 }
 
 fn normalize_ids(mut ids: Vec<usize>) -> Vec<usize> {

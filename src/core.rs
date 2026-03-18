@@ -74,7 +74,7 @@ struct Cli {
     #[arg(
         long,
         value_enum,
-        default_value_t = ReviewerKind::Simple,
+        default_value_t = ReviewerKind::Progressive,
         help = "Reviewer strategy used by theorem_graph_review"
     )]
     reviewer: ReviewerKind,
@@ -1592,14 +1592,56 @@ fn run_view(cli: &Cli) -> Result<()> {
     };
 
     let output = match (id, path_to) {
-        (Some(id), None) => history.theorem_graph.examine(*id)?,
-        (None, Some(id)) => history.theorem_graph.path_to(*id)?,
+        (Some(id), None) => history.theorem_graph.examine_markdown(*id)?,
+        (None, Some(id)) => history.theorem_graph.path_to_markdown(*id)?,
         (None, None) => bail!("view requires exactly one of --id or --path-to"),
         (Some(_), Some(_)) => bail!("view accepts only one of --id or --path-to"),
     };
 
+    eprintln!("{}", build_view_save_hint(cli));
     println!("{output}");
     Ok(())
+}
+
+fn build_view_save_hint(cli: &Cli) -> String {
+    let mut command = String::from("aimv2 view");
+    if let Some(log_path) = &cli.log_path {
+        command.push_str(&format!(
+            " --log-path {}",
+            shell_escape(&log_path.display().to_string())
+        ));
+    } else {
+        command.push_str(" --last");
+    }
+
+    if let Some(CliCommand::View { last, id, path_to }) = &cli.command {
+        if *last && cli.log_path.is_none() {
+            command = String::from("aimv2 view --last");
+        }
+        if let Some(id) = id {
+            command.push_str(&format!(" --id {id}"));
+            command.push_str(&format!(" > theorem-{id}.md"));
+        }
+        if let Some(id) = path_to {
+            command.push_str(&format!(" --path-to {id}"));
+            command.push_str(&format!(" > theorem-path-{id}.md"));
+        }
+    }
+
+    format!(
+        "note: save this markdown to a local file with:\n  {command}\nthen open the generated `.md` file in your markdown viewer."
+    )
+}
+
+fn shell_escape(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || "/._-".contains(ch))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
 }
 
 fn resolve_log_path(workspace_root: &Path, path: Option<PathBuf>) -> Result<Option<PathBuf>> {
