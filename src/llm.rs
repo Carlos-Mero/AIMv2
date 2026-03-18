@@ -11,7 +11,7 @@ use async_openai::{
     },
 };
 use futures::StreamExt;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[derive(Clone, Debug)]
 pub(crate) struct LlmConfig {
@@ -492,6 +492,8 @@ fn finalize_tool_calls(tool_calls: Vec<PartialToolCall>) -> Result<Vec<ToolCall>
                 call.id
             );
         }
+        validate_tool_call_arguments(&call.name, &call.arguments)
+            .with_context(|| format!("tool call {} has malformed JSON arguments", call.id))?;
         finalized.push(ToolCall {
             id: call.id,
             name: call.name,
@@ -508,17 +510,33 @@ fn extract_tool_calls(
     let mut parsed = Vec::new();
     for tool_call in tool_calls.unwrap_or_default() {
         match tool_call {
-            ChatCompletionMessageToolCalls::Function(call) => parsed.push(ToolCall {
-                id: call.id,
-                name: call.function.name,
-                arguments: call.function.arguments,
-            }),
+            ChatCompletionMessageToolCalls::Function(call) => {
+                validate_tool_call_arguments(&call.function.name, &call.function.arguments)
+                    .with_context(|| {
+                        format!("tool call {} has malformed JSON arguments", call.id)
+                    })?;
+                parsed.push(ToolCall {
+                    id: call.id,
+                    name: call.function.name,
+                    arguments: call.function.arguments,
+                });
+            }
             ChatCompletionMessageToolCalls::Custom(call) => {
                 bail!("unsupported custom tool call: {}", call.custom_tool.name);
             }
         }
     }
     Ok(parsed)
+}
+
+fn validate_tool_call_arguments(tool_name: &str, arguments: &str) -> Result<()> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        bail!("tool {tool_name} returned empty arguments");
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .with_context(|| format!("tool {tool_name} arguments are not valid JSON: {trimmed}"))?;
+    Ok(())
 }
 
 pub(crate) fn report_api_error(err: &anyhow::Error) {
