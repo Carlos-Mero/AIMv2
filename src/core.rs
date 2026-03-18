@@ -7,28 +7,32 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_openai::types::chat::ReasoningEffort;
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand, ValueEnum};
+use futures::future::try_join_all;
 use history::{
     AssistantToolCall, CompactionMode, HistoryEntry, HistoryFile, build_messages,
     token_limit_for_model,
 };
-use llm::{LlmConfig, ToolCall, build_client, call_model, report_api_error};
+use llm::{LlmConfig, ToolCall, ToolMode, build_client, call_model, report_api_error};
 use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use theorem_graph::TheoremEntryType;
+use tokio::sync::Mutex as AsyncMutex;
 use ui::{
     COLOR_BLUE, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_GREEN, COLOR_RED, COLOR_YELLOW,
-    editor_prompt, print_statusline, print_tool_call, print_tool_result, prompt_for_approval,
-    role_prefix, style,
+    editor_prompt, print_background_error, print_background_wait, print_named_tool_call,
+    print_statusline, print_tool_call, print_tool_result, prompt_for_approval, role_prefix, style,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-5.4";
 const LOOP_LIMIT: usize = 64;
+const PROGRESSIVE_REVIEW_MIN_CHUNK_LINES: usize = 4;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,10 +73,25 @@ struct Cli {
 
     #[arg(
         long,
-        default_value_t = 12,
-        help = "Minimum reviews required on theorem dependencies before claiming a final result"
+        value_enum,
+        default_value_t = ReviewerKind::Simple,
+        help = "Reviewer strategy used by theorem_graph_review"
     )]
-    reviews: u32,
+    reviewer: ReviewerKind,
+
+    #[arg(
+        long,
+        default_value_t = 4,
+        help = "Number of parallel review runs used by the simple reviewer"
+    )]
+    simple_reviews: u32,
+
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "Maximum iterations used by the progressive reviewer"
+    )]
+    progressive_iterations: u32,
 
     #[arg(
         long,
@@ -142,17 +161,25 @@ impl From<CliReasoningEffort> for ReasoningEffort {
 struct Config {
     llm: LlmConfig,
     history_token_limit: u64,
-    minimal_reviews: u32,
+    reviewer: ReviewerConfig,
     workspace_root: PathBuf,
     enable_shell: bool,
 }
 
 struct App {
+    history_path: PathBuf,
+    session: Session,
+}
+
+#[derive(Clone)]
+struct Session {
     client: llm::LlmClient,
     config: Config,
-    history_path: PathBuf,
+    theorem_graph: Arc<AsyncMutex<theorem_graph::TheoremGraph>>,
     history: HistoryFile,
-    auto_approve: bool,
+    auto_approve: Arc<Mutex<bool>>,
+    allow_auto_compaction: bool,
+    emit_output: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +241,68 @@ struct TheoremGraphReviseArgs {
     dependencies: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ReviewerKind {
+    Simple,
+    Progressive,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewerConfig {
+    kind: ReviewerKind,
+    simple_reviews: u32,
+    progressive_iterations: u32,
+}
+
+impl ReviewerConfig {
+    fn active_label(&self) -> &'static str {
+        match self.kind {
+            ReviewerKind::Simple => "simple",
+            ReviewerKind::Progressive => "progressive",
+        }
+    }
+
+    fn description(&self) -> String {
+        match self.kind {
+            ReviewerKind::Simple => format!(
+                "simple reviewer with {} parallel reviews",
+                self.simple_reviews
+            ),
+            ReviewerKind::Progressive => format!(
+                "progressive reviewer with {} iterations",
+                self.progressive_iterations
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TheoremGraphCommentArgs {
+    id: usize,
+    comment: String,
+}
+
+enum ReviewRunOutcome {
+    NoError,
+    Commented,
+}
+
+#[derive(Clone, Copy)]
+enum SessionMode {
+    Normal,
+    Review,
+}
+
+struct SessionOutcome {
+    assistant_reply: Option<String>,
+    review_outcome: ReviewRunOutcome,
+}
+
+struct ReviewBatchSummary {
+    reviews_run: u32,
+    commented_reviews: u32,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -252,19 +341,32 @@ impl App {
                 reasoning_effort: cli.reasoning_effort.into(),
             },
             history_token_limit,
-            minimal_reviews: cli.reviews,
+            reviewer: ReviewerConfig {
+                kind: cli.reviewer,
+                simple_reviews: cli.simple_reviews,
+                progressive_iterations: cli.progressive_iterations,
+            },
             workspace_root: workspace_root.clone(),
             enable_shell: cli.enable_shell,
         };
         let (history_path, history) =
             load_or_create_session(&workspace_root, explicit_log_path.as_deref(), resume)?;
 
-        Ok(Self {
+        let theorem_graph = Arc::new(AsyncMutex::new(history.theorem_graph.clone()));
+        let auto_approve = Arc::new(Mutex::new(cli.auto));
+        let session = Session {
             client: build_client(&api_key, &base_url),
             config,
-            history_path,
+            theorem_graph,
             history,
-            auto_approve: cli.auto,
+            auto_approve,
+            allow_auto_compaction: true,
+            emit_output: true,
+        };
+
+        Ok(Self {
+            history_path,
+            session,
         })
     }
 
@@ -273,28 +375,42 @@ impl App {
         println!(
             "{} {}",
             style(COLOR_DIM, "workspace:"),
-            self.config.workspace_root.display()
+            self.session.config.workspace_root.display()
         );
-        println!("{} {}", style(COLOR_DIM, "model:"), self.config.llm.model);
+        println!(
+            "{} {}",
+            style(COLOR_DIM, "model:"),
+            self.session.config.llm.model
+        );
         println!(
             "{} {:?}",
             style(COLOR_DIM, "reasoning effort:"),
-            self.config.llm.reasoning_effort
+            self.session.config.llm.reasoning_effort
         );
         println!(
             "{} {}",
             style(COLOR_DIM, "history token limit:"),
-            self.config.history_token_limit
+            self.session.config.history_token_limit
         );
         println!(
             "{} {}",
-            style(COLOR_DIM, "minimal reviews:"),
-            self.config.minimal_reviews
+            style(COLOR_DIM, "reviewer:"),
+            self.session.config.reviewer.active_label()
+        );
+        println!(
+            "{} {}",
+            style(COLOR_DIM, "simple reviews:"),
+            self.session.config.reviewer.simple_reviews
+        );
+        println!(
+            "{} {}",
+            style(COLOR_DIM, "progressive iterations:"),
+            self.session.config.reviewer.progressive_iterations
         );
         println!(
             "{} {}",
             style(COLOR_DIM, "shell tool:"),
-            if self.config.enable_shell {
+            if self.session.config.enable_shell {
                 style(COLOR_GREEN, "enabled")
             } else {
                 style(COLOR_DIM, "disabled")
@@ -303,18 +419,18 @@ impl App {
         println!(
             "{} {}",
             style(COLOR_DIM, "session:"),
-            self.history.session_id
+            self.session.history.session_id
         );
         println!(
             "{} {}",
             style(COLOR_DIM, "history:"),
             self.history_path.display()
         );
-        if self.config.enable_shell {
+        if self.session.config.enable_shell {
             println!(
                 "{} {}",
                 style(COLOR_DIM, "approval mode:"),
-                if self.auto_approve {
+                if self.session.auto_approve() {
                     style(COLOR_YELLOW, "auto")
                 } else {
                     style(COLOR_CYAN, "ask")
@@ -358,31 +474,68 @@ impl App {
                 }
                 "/help" => {
                     print_repl_help(
-                        self.auto_approve,
-                        self.config.enable_shell,
+                        self.session.auto_approve(),
+                        self.session.config.enable_shell,
+                        &self.session.config.reviewer,
                         &self.history_path,
                     );
                     continue;
                 }
+                "/compact" => {
+                    match self.compact_history(CompactionMode::BeforeTurn, true).await {
+                        Ok(true) => println!("{}", style(COLOR_YELLOW, "history compacted")),
+                        Ok(false) => println!("{}", style(COLOR_YELLOW, "nothing to compact yet")),
+                        Err(err) => eprintln!("{} {err:#}", style(COLOR_RED, "error>")),
+                    }
+                    continue;
+                }
                 "/auto on" => {
-                    if !self.config.enable_shell {
+                    if !self.session.config.enable_shell {
                         println!("{}", style(COLOR_YELLOW, "shell tool is disabled"));
                     } else {
-                        self.auto_approve = true;
+                        self.session.set_auto_approve(true);
                         println!("{}", style(COLOR_YELLOW, "auto approval enabled"));
                     }
                     continue;
                 }
                 "/auto off" => {
-                    if !self.config.enable_shell {
+                    if !self.session.config.enable_shell {
                         println!("{}", style(COLOR_YELLOW, "shell tool is disabled"));
                     } else {
-                        self.auto_approve = false;
+                        self.session.set_auto_approve(false);
                         println!("{}", style(COLOR_YELLOW, "auto approval disabled"));
                     }
                     continue;
                 }
                 _ => {}
+            }
+
+            if let Some(kind) = parse_reviewer_command(&line) {
+                self.session.config.reviewer.kind = kind;
+                println!(
+                    "{} {}",
+                    style(COLOR_YELLOW, "reviewer set to"),
+                    self.session.config.reviewer.description()
+                );
+                continue;
+            }
+            if let Some(reviews) = parse_u32_command(&line, "/reviews") {
+                self.session.config.reviewer.simple_reviews = reviews.max(1);
+                println!(
+                    "{} {}",
+                    style(COLOR_YELLOW, "simple reviews set to"),
+                    self.session.config.reviewer.simple_reviews
+                );
+                continue;
+            }
+            if let Some(iterations) = parse_u32_command(&line, "/iterations") {
+                self.session.config.reviewer.progressive_iterations = iterations.max(1);
+                println!(
+                    "{} {}",
+                    style(COLOR_YELLOW, "progressive iterations set to"),
+                    self.session.config.reviewer.progressive_iterations
+                );
+                continue;
             }
 
             if let Err(err) = self.run_turn(line).await {
@@ -394,35 +547,176 @@ impl App {
     }
 
     async fn run_turn(&mut self, user_input: String) -> Result<()> {
-        self.compact_history_if_needed(CompactionMode::BeforeTurn)
+        self.compact_history(CompactionMode::BeforeTurn, false)
             .await?;
-        self.history.push_user(user_input);
-        self.save_history()?;
-        self.run_agent_loop().await
+        self.session.history.push_user(user_input);
+        self.save_history().await?;
+        self.session.run_agent_loop(SessionMode::Normal).await?;
+        self.save_history().await
     }
 
     async fn continue_turn(&mut self) -> Result<()> {
-        self.run_agent_loop().await
+        self.session.run_agent_loop(SessionMode::Normal).await?;
+        self.save_history().await
     }
 
-    async fn run_agent_loop(&mut self) -> Result<()> {
+    async fn compact_history(&mut self, mode: CompactionMode, force: bool) -> Result<bool> {
+        if self.session.history.entries.is_empty() {
+            return Ok(false);
+        }
+        if !force
+            && !self
+                .session
+                .history
+                .needs_compaction(self.session.config.history_token_limit)
+        {
+            return Ok(false);
+        }
+
+        let resume_user = if mode == CompactionMode::MidTurn {
+            self.session.history.last_user_content()
+        } else {
+            None
+        };
+        let mut sub_session = self.session.spawn_subsession(false, false);
+        sub_session
+            .history
+            .push_user(self.session.history.compaction_prompt(mode));
+        let base_history = self.session.history.clone();
+        if self.session.emit_output {
+            print_background_wait("waiting for background compaction session to complete");
+        }
+        let outcome = Box::pin(sub_session.run_agent_loop(SessionMode::Normal))
+            .await
+            .map_err(|err| {
+                if self.session.emit_output {
+                    print_background_error(&format!("background compaction failed: {err:#}"));
+                }
+                err
+            })?;
+        self.session
+            .history
+            .apply_usage_delta(usage_delta(&base_history, &sub_session.history));
+        let summary = outcome
+            .assistant_reply
+            .ok_or_else(|| anyhow!("compaction session did not produce an assistant response"))?;
+        self.session.history.apply_compaction(summary, resume_user);
+        self.save_history().await?;
+        Ok(true)
+    }
+
+    fn print_history(&self) {
+        if self.session.history.entries.is_empty() {
+            return;
+        }
+
+        println!("{}", style(COLOR_BOLD, "resumed history"));
+        for entry in &self.session.history.entries {
+            match entry {
+                HistoryEntry::System { content, .. } => {
+                    println!("{}{}", role_prefix("system", COLOR_YELLOW), content);
+                }
+                HistoryEntry::User { content, .. } => {
+                    println!("{}{}", role_prefix("you", COLOR_BLUE), content);
+                }
+                HistoryEntry::Assistant { content, .. } => {
+                    if !content.trim().is_empty() {
+                        println!("{}{}", role_prefix("assistant", COLOR_GREEN), content);
+                    }
+                }
+                HistoryEntry::Tool { content, .. } => {
+                    print_tool_result(
+                        &normalize_tool_content_for_display(content),
+                        tool_content_success(content),
+                    );
+                }
+            }
+        }
+    }
+
+    fn print_statusline(&self) {
+        print_statusline(
+            &self.session.config.workspace_root,
+            &self.session.config.llm.model,
+            self.session.history.active_token_usage(),
+            self.session.config.history_token_limit,
+            self.session.history.total_input_usage(),
+            self.session.history.total_output_usage(),
+        );
+    }
+
+    async fn save_history(&mut self) -> Result<()> {
+        let snapshot = self.session.snapshot_history().await;
+        let text = serde_json::to_string_pretty(&snapshot).context("failed to encode history")?;
+        fs::write(&self.history_path, text).with_context(|| {
+            format!(
+                "failed to write history file {}",
+                self.history_path.display()
+            )
+        })
+    }
+}
+
+impl Session {
+    fn auto_approve(&self) -> bool {
+        *self
+            .auto_approve
+            .lock()
+            .expect("auto approval mutex poisoned")
+    }
+
+    fn set_auto_approve(&self, value: bool) {
+        *self
+            .auto_approve
+            .lock()
+            .expect("auto approval mutex poisoned") = value;
+    }
+
+    fn spawn_subsession(&self, allow_auto_compaction: bool, emit_output: bool) -> Self {
+        Self {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            theorem_graph: Arc::clone(&self.theorem_graph),
+            history: self.history.clone_at_model_boundary(),
+            auto_approve: Arc::clone(&self.auto_approve),
+            allow_auto_compaction,
+            emit_output,
+        }
+    }
+
+    async fn snapshot_history(&self) -> HistoryFile {
+        let mut snapshot = self.history.clone();
+        snapshot.last_active_at_ms = now_millis();
+        snapshot.theorem_graph = self.theorem_graph.lock().await.clone();
+        snapshot
+    }
+
+    async fn run_agent_loop(&mut self, mode: SessionMode) -> Result<SessionOutcome> {
         for _ in 0..LOOP_LIMIT {
-            self.compact_history_if_needed(CompactionMode::MidTurn)
-                .await?;
+            if self.allow_auto_compaction {
+                self.compact_history_if_needed(CompactionMode::MidTurn)
+                    .await?;
+            }
             let messages = build_messages(
                 &self.config.workspace_root,
                 &self.history.entries,
                 self.config.enable_shell,
-                self.config.minimal_reviews,
+                &self.config.reviewer.description(),
             );
             let mut started_stream = false;
+            let emit_output = self.emit_output;
             let reply = match call_model(
                 &self.client,
                 &self.config.llm,
                 messages,
-                true,
-                self.config.enable_shell,
+                Some(ToolMode::Agent {
+                    enable_shell: self.config.enable_shell,
+                }),
+                self.emit_output,
                 |chunk| {
+                    if !emit_output {
+                        return;
+                    }
                     if !started_stream {
                         print!("{}", role_prefix("assistant", COLOR_GREEN));
                         io::stdout().flush().ok();
@@ -436,18 +730,26 @@ impl App {
             {
                 Ok(reply) => reply,
                 Err(err) => {
-                    report_api_error(&err);
+                    if self.emit_output {
+                        report_api_error(&err);
+                    }
                     return Err(err);
                 }
             };
             if started_stream {
                 println!();
             }
+
             self.history.note_api_usage(
                 reply.input_tokens,
                 reply.output_tokens,
                 reply.total_tokens,
             );
+            let assistant_reply = if reply.content.trim().is_empty() {
+                None
+            } else {
+                Some(reply.content.clone())
+            };
             let assistant_tool_calls = reply
                 .tool_calls
                 .iter()
@@ -462,15 +764,23 @@ impl App {
                 reply.reasoning.clone(),
                 assistant_tool_calls,
             );
-            self.save_history()?;
 
-            if !reply.tool_calls.is_empty() {
-                self.handle_tool_calls(reply.tool_calls)?;
-                self.save_history()?;
-                continue;
+            if reply.tool_calls.is_empty() {
+                return Ok(SessionOutcome {
+                    assistant_reply,
+                    review_outcome: ReviewRunOutcome::NoError,
+                });
             }
 
-            return Ok(());
+            let review_outcome = self.handle_tool_calls(reply.tool_calls).await?;
+            if matches!(mode, SessionMode::Review)
+                && matches!(review_outcome, ReviewRunOutcome::Commented)
+            {
+                return Ok(SessionOutcome {
+                    assistant_reply,
+                    review_outcome,
+                });
+            }
         }
 
         Err(anyhow!(
@@ -478,93 +788,142 @@ impl App {
         ))
     }
 
-    async fn compact_history_if_needed(&mut self, mode: CompactionMode) -> Result<()> {
-        if !self
-            .history
-            .needs_compaction(self.config.history_token_limit)
+    async fn compact_history_if_needed(&mut self, mode: CompactionMode) -> Result<bool> {
+        if self.history.entries.is_empty()
+            || !self
+                .history
+                .needs_compaction(self.config.history_token_limit)
         {
-            return Ok(());
+            return Ok(false);
         }
 
+        let base_history = self.history.clone();
         let resume_user = if mode == CompactionMode::MidTurn {
             self.history.last_user_content()
         } else {
             None
         };
-        self.history.push_user(self.history.compaction_prompt(mode));
-        let messages = build_messages(
-            &self.config.workspace_root,
-            &self.history.entries,
-            false,
-            self.config.minimal_reviews,
-        );
-        let reply = match call_model(
-            &self.client,
-            &self.config.llm,
-            messages,
-            false,
-            false,
-            |_| {},
-        )
-        .await
-        {
-            Ok(reply) => reply,
-            Err(err) => {
-                report_api_error(&err);
-                return Err(err);
-            }
-        };
+        let mut sub_session = self.spawn_subsession(false, false);
+        sub_session
+            .history
+            .push_user(self.history.compaction_prompt(mode));
+        if self.emit_output {
+            print_background_wait("waiting for background compaction session to complete");
+        }
+        let outcome = Box::pin(sub_session.run_agent_loop(SessionMode::Normal))
+            .await
+            .map_err(|err| {
+                if self.emit_output {
+                    print_background_error(&format!("background compaction failed: {err:#}"));
+                }
+                err
+            })?;
         self.history
-            .note_api_usage(reply.input_tokens, reply.output_tokens, reply.total_tokens);
-        self.history.apply_compaction(reply.content, resume_user);
-        self.save_history()
+            .apply_usage_delta(usage_delta(&base_history, &sub_session.history));
+        let summary = outcome
+            .assistant_reply
+            .ok_or_else(|| anyhow!("compaction session did not produce an assistant response"))?;
+        self.history.apply_compaction(summary, resume_user);
+        Ok(true)
     }
 
-    fn handle_tool_calls(&mut self, tool_calls: Vec<ToolCall>) -> Result<()> {
+    async fn handle_tool_calls(&mut self, tool_calls: Vec<ToolCall>) -> Result<ReviewRunOutcome> {
+        let mut review_outcome = ReviewRunOutcome::NoError;
         for tool_call in tool_calls {
-            let (success, content) = match tool_call.name.as_str() {
+            let (success, content, current_review_outcome) = match tool_call.name.as_str() {
                 "shell_tool" => {
                     if !self.config.enable_shell {
                         (
                             false,
                             "shell_tool is disabled for this session; restart with --enable-shell to allow workspace commands".to_string(),
+                            ReviewRunOutcome::NoError,
                         )
                     } else {
                         match parse_shell_tool_args(&tool_call)
                             .and_then(|request| self.run_shell(request))
                         {
-                            Ok(outcome) => (outcome.success, outcome.tool_content),
-                            Err(err) => (false, format!("tool error: {err:#}")),
+                            Ok(outcome) => (
+                                outcome.success,
+                                outcome.tool_content,
+                                ReviewRunOutcome::NoError,
+                            ),
+                            Err(err) => (
+                                false,
+                                format!("tool error: {err:#}"),
+                                ReviewRunOutcome::NoError,
+                            ),
                         }
                     }
                 }
-                "theorem_graph_push" => match self.handle_theorem_graph_push(&tool_call) {
-                    Ok(content) => (true, content),
-                    Err(err) => (false, format!("tool error: {err:#}")),
+                "theorem_graph_push" => match self.handle_theorem_graph_push(&tool_call).await {
+                    Ok(content) => (true, content, ReviewRunOutcome::NoError),
+                    Err(err) => (
+                        false,
+                        format!("tool error: {err:#}"),
+                        ReviewRunOutcome::NoError,
+                    ),
                 },
-                "theorem_graph_list" => match self.handle_theorem_graph_list(&tool_call) {
-                    Ok(content) => (true, content),
-                    Err(err) => (false, format!("tool error: {err:#}")),
+                "theorem_graph_list" => match self.handle_theorem_graph_list(&tool_call).await {
+                    Ok(content) => (true, content, ReviewRunOutcome::NoError),
+                    Err(err) => (
+                        false,
+                        format!("tool error: {err:#}"),
+                        ReviewRunOutcome::NoError,
+                    ),
                 },
                 "theorem_graph_list_deps" => {
-                    match self.handle_theorem_graph_list_deps(&tool_call) {
-                        Ok(content) => (true, content),
-                        Err(err) => (false, format!("tool error: {err:#}")),
+                    match self.handle_theorem_graph_list_deps(&tool_call).await {
+                        Ok(content) => (true, content, ReviewRunOutcome::NoError),
+                        Err(err) => (
+                            false,
+                            format!("tool error: {err:#}"),
+                            ReviewRunOutcome::NoError,
+                        ),
                     }
                 }
-                "theorem_graph_examine" => match self.handle_theorem_graph_examine(&tool_call) {
-                    Ok(content) => (true, content),
-                    Err(err) => (false, format!("tool error: {err:#}")),
+                "theorem_graph_examine" => {
+                    match self.handle_theorem_graph_examine(&tool_call).await {
+                        Ok(content) => (true, content, ReviewRunOutcome::NoError),
+                        Err(err) => (
+                            false,
+                            format!("tool error: {err:#}"),
+                            ReviewRunOutcome::NoError,
+                        ),
+                    }
+                }
+                "theorem_graph_review" => {
+                    match self.handle_theorem_graph_review(&tool_call).await {
+                        Ok(content) => (true, content, ReviewRunOutcome::NoError),
+                        Err(err) => (
+                            false,
+                            format!("tool error: {err:#}"),
+                            ReviewRunOutcome::NoError,
+                        ),
+                    }
+                }
+                "comment" => match self.handle_theorem_graph_comment(&tool_call).await {
+                    Ok(content) => (true, content, ReviewRunOutcome::Commented),
+                    Err(err) => (
+                        false,
+                        format!("tool error: {err:#}"),
+                        ReviewRunOutcome::NoError,
+                    ),
                 },
-                "theorem_graph_review" => match self.handle_theorem_graph_review(&tool_call) {
-                    Ok(content) => (true, content),
-                    Err(err) => (false, format!("tool error: {err:#}")),
-                },
-                "theorem_graph_revise" => match self.handle_theorem_graph_revise(&tool_call) {
-                    Ok(content) => (true, content),
-                    Err(err) => (false, format!("tool error: {err:#}")),
-                },
-                other => (false, format!("unsupported tool: {other}")),
+                "theorem_graph_revise" => {
+                    match self.handle_theorem_graph_revise(&tool_call).await {
+                        Ok(content) => (true, content, ReviewRunOutcome::NoError),
+                        Err(err) => (
+                            false,
+                            format!("tool error: {err:#}"),
+                            ReviewRunOutcome::NoError,
+                        ),
+                    }
+                }
+                other => (
+                    false,
+                    format!("unsupported tool: {other}"),
+                    ReviewRunOutcome::NoError,
+                ),
             };
 
             let display = if tool_call.name == "shell_tool" {
@@ -572,16 +931,35 @@ impl App {
             } else {
                 content.clone()
             };
-            print_tool_result(&display, success);
+            if self.emit_output {
+                print_tool_result(&display, success);
+            }
             self.history
                 .push_tool(tool_call.id, tool_call.name, content);
+            if matches!(current_review_outcome, ReviewRunOutcome::Commented) {
+                review_outcome = ReviewRunOutcome::Commented;
+            }
         }
-        Ok(())
+        Ok(review_outcome)
     }
 
-    fn handle_theorem_graph_push(&mut self, tool_call: &ToolCall) -> Result<String> {
+    async fn handle_theorem_graph_push(&mut self, tool_call: &ToolCall) -> Result<String> {
         let args: TheoremGraphPushArgs = parse_tool_args(tool_call)?;
-        self.history.theorem_graph.push(
+        if self.emit_output {
+            print_named_tool_call(
+                "theorem_graph_push",
+                &format!(
+                    "type: {}\nstatement: {}\ndependencies: {:?}",
+                    match args.entry_type {
+                        TheoremEntryType::Context => "context",
+                        TheoremEntryType::Theorem => "theorem",
+                    },
+                    preview_text(&args.statement, 120),
+                    args.dependencies
+                ),
+            );
+        }
+        self.theorem_graph.lock().await.push(
             args.entry_type,
             args.statement,
             args.proof,
@@ -589,39 +967,217 @@ impl App {
         )
     }
 
-    fn handle_theorem_graph_list(&mut self, tool_call: &ToolCall) -> Result<String> {
+    async fn handle_theorem_graph_list(&mut self, tool_call: &ToolCall) -> Result<String> {
         let args: TheoremGraphListArgs = parse_tool_args(tool_call)?;
-        self.history.theorem_graph.list(args.start, args.end)
+        if self.emit_output {
+            print_named_tool_call(
+                "theorem_graph_list",
+                &format!("start: {}\nend: {}", args.start, args.end),
+            );
+        }
+        self.theorem_graph.lock().await.list(args.start, args.end)
     }
 
-    fn handle_theorem_graph_list_deps(&mut self, tool_call: &ToolCall) -> Result<String> {
+    async fn handle_theorem_graph_list_deps(&mut self, tool_call: &ToolCall) -> Result<String> {
         let args: TheoremGraphIdArgs = parse_tool_args(tool_call)?;
-        self.history.theorem_graph.list_deps(args.id)
+        if self.emit_output {
+            print_named_tool_call("theorem_graph_list_deps", &format!("id: {}", args.id));
+        }
+        self.theorem_graph.lock().await.list_deps(args.id)
     }
 
-    fn handle_theorem_graph_examine(&mut self, tool_call: &ToolCall) -> Result<String> {
+    async fn handle_theorem_graph_examine(&mut self, tool_call: &ToolCall) -> Result<String> {
         let args: TheoremGraphIdArgs = parse_tool_args(tool_call)?;
-        self.history.theorem_graph.examine(args.id)
+        if self.emit_output {
+            print_named_tool_call("theorem_graph_examine", &format!("id: {}", args.id));
+        }
+        self.theorem_graph.lock().await.examine(args.id)
     }
 
-    fn handle_theorem_graph_review(&mut self, tool_call: &ToolCall) -> Result<String> {
+    async fn handle_theorem_graph_review(&mut self, tool_call: &ToolCall) -> Result<String> {
         let args: TheoremGraphIdArgs = parse_tool_args(tool_call)?;
-        self.history.theorem_graph.review(args.id)
+        if self.emit_output {
+            print_named_tool_call("theorem_graph_review", &format!("id: {}", args.id));
+        }
+        match self.config.reviewer.kind {
+            ReviewerKind::Simple => self.run_simple_reviewer(args.id).await,
+            ReviewerKind::Progressive => self.run_progressive_reviewer(args.id).await,
+        }
     }
 
-    fn handle_theorem_graph_revise(&mut self, tool_call: &ToolCall) -> Result<String> {
+    async fn handle_theorem_graph_comment(&mut self, tool_call: &ToolCall) -> Result<String> {
+        let args: TheoremGraphCommentArgs = parse_tool_args(tool_call)?;
+        if self.emit_output {
+            print_named_tool_call(
+                "comment",
+                &format!(
+                    "id: {}\ncomment: {}",
+                    args.id,
+                    preview_text(&args.comment, 120)
+                ),
+            );
+        }
+        self.theorem_graph
+            .lock()
+            .await
+            .append_comment(args.id, args.comment)
+    }
+
+    async fn handle_theorem_graph_revise(&mut self, tool_call: &ToolCall) -> Result<String> {
         let args: TheoremGraphReviseArgs = parse_tool_args(tool_call)?;
-        self.history
-            .theorem_graph
+        if self.emit_output {
+            print_named_tool_call(
+                "theorem_graph_revise",
+                &format!(
+                    "id: {}\nproof: {}\ndependencies: {:?}",
+                    args.id,
+                    preview_text(&args.proof, 120),
+                    args.dependencies
+                ),
+            );
+        }
+        self.theorem_graph
+            .lock()
+            .await
             .revise(args.id, args.proof, args.dependencies)
     }
 
-    fn run_shell(&mut self, request: ShellRequest) -> Result<CommandOutcome> {
+    async fn run_simple_reviewer(&mut self, id: usize) -> Result<String> {
+        let review_count = self.config.reviewer.simple_reviews.max(1);
+        self.theorem_graph.lock().await.examine(id)?;
+        let prompts = (0..review_count)
+            .map(|_| simple_review_prompt(id))
+            .collect::<Vec<_>>();
+        let summary = self.run_review_batch(prompts).await?;
+
+        let total_reviews = self
+            .theorem_graph
+            .lock()
+            .await
+            .add_reviews(id, review_count)?;
+        Ok(format!(
+            "completed {review_count} simple reviews for theorem entry {id}; flagged by {}; total reviews: {total_reviews}",
+            summary.commented_reviews
+        ))
+    }
+
+    async fn run_progressive_reviewer(&mut self, id: usize) -> Result<String> {
+        self.theorem_graph.lock().await.examine(id)?;
+
+        let iteration_limit = self.config.reviewer.progressive_iterations.max(1);
+        let mut reviews_run = 0_u32;
+        let mut commented_reviews = 0_u32;
+
+        let initial = self
+            .run_review_batch(vec![simple_review_prompt(id)])
+            .await?;
+        reviews_run = reviews_run.saturating_add(initial.reviews_run);
+        commented_reviews = commented_reviews.saturating_add(initial.commented_reviews);
+
+        if commented_reviews == 0 {
+            for iteration in 1..iteration_limit {
+                let entry = self.theorem_graph.lock().await.entry_snapshot(id)?;
+                let prompts = progressive_review_prompts(
+                    id,
+                    &entry.statement,
+                    &entry.proof,
+                    iteration as usize,
+                );
+                let batch = self.run_review_batch(prompts).await?;
+                reviews_run = reviews_run.saturating_add(batch.reviews_run);
+                commented_reviews = commented_reviews.saturating_add(batch.commented_reviews);
+                if batch.commented_reviews > 0 {
+                    break;
+                }
+            }
+        }
+
+        let total_reviews = self
+            .theorem_graph
+            .lock()
+            .await
+            .add_reviews(id, reviews_run)?;
+        Ok(format!(
+            "completed {reviews_run} progressive reviews for theorem entry {id}; flagged by {commented_reviews}; total reviews: {total_reviews}"
+        ))
+    }
+
+    async fn run_review_batch(&mut self, prompts: Vec<String>) -> Result<ReviewBatchSummary> {
+        let base_history = self.history.clone();
+        let review_count = prompts.len();
+        let review_tasks = prompts
+            .into_iter()
+            .enumerate()
+            .map(|(index, prompt)| {
+                let mut sub_session = self.spawn_subsession(false, false);
+                sub_session.history.push_user(prompt);
+                async move {
+                    sub_session
+                        .run_agent_loop(SessionMode::Review)
+                        .await
+                        .map(|outcome| (sub_session.history, outcome))
+                        .with_context(|| format!("background review session {} failed", index + 1))
+                }
+            })
+            .collect::<Vec<_>>();
+        if self.emit_output {
+            print_background_wait(&format!(
+                "waiting for {review_count} background review session(s) to complete"
+            ));
+        }
+        let outcomes = try_join_all(review_tasks).await.map_err(|err| {
+            if self.emit_output {
+                print_background_error(&format!("{err:#}"));
+            }
+            err
+        })?;
+
+        let mut total_input_delta = 0_u64;
+        let mut total_output_delta = 0_u64;
+        let mut total_delta = 0_u64;
+        let mut commented_reviews = 0_u32;
+        let reviews_run = outcomes.len() as u32;
+        for (history, outcome) in outcomes {
+            let (input_delta, output_delta, delta_total) = usage_delta(&base_history, &history);
+            total_input_delta = total_input_delta.saturating_add(input_delta);
+            total_output_delta = total_output_delta.saturating_add(output_delta);
+            total_delta = total_delta.saturating_add(delta_total);
+            if matches!(outcome.review_outcome, ReviewRunOutcome::Commented) {
+                commented_reviews = commented_reviews.saturating_add(1);
+            }
+        }
+        self.history
+            .apply_usage_delta((total_input_delta, total_output_delta, total_delta));
+
+        Ok(ReviewBatchSummary {
+            reviews_run,
+            commented_reviews,
+        })
+    }
+
+    fn run_shell(&self, request: ShellRequest) -> Result<CommandOutcome> {
         let workdir = resolve_workdir(&self.config.workspace_root, request.workdir.as_deref())?;
 
         let workdir_text = workdir.display().to_string();
-        print_tool_call(&request.command, &workdir_text);
-        if !self.auto_approve && !prompt_for_approval(&mut self.auto_approve)? {
+        if self.emit_output {
+            print_tool_call(&request.command, &workdir_text);
+        }
+        let mut auto_approve = self
+            .auto_approve
+            .lock()
+            .expect("auto approval mutex poisoned");
+        if !self.emit_output && !*auto_approve {
+            return Ok(CommandOutcome {
+                success: false,
+                tool_content: format_tool_content(
+                    &request.command,
+                    &workdir_text,
+                    false,
+                    "command rejected because interactive approval is unavailable in background sessions".to_string(),
+                ),
+            });
+        }
+        if !*auto_approve && !prompt_for_approval(&mut *auto_approve)? {
             return Ok(CommandOutcome {
                 success: false,
                 tool_content: format_tool_content(
@@ -675,58 +1231,6 @@ impl App {
             ),
         })
     }
-
-    fn print_history(&self) {
-        if self.history.entries.is_empty() {
-            return;
-        }
-
-        println!("{}", style(COLOR_BOLD, "resumed history"));
-        for entry in &self.history.entries {
-            match entry {
-                HistoryEntry::System { content, .. } => {
-                    println!("{}{}", role_prefix("system", COLOR_YELLOW), content);
-                }
-                HistoryEntry::User { content, .. } => {
-                    println!("{}{}", role_prefix("you", COLOR_BLUE), content);
-                }
-                HistoryEntry::Assistant { content, .. } => {
-                    if !content.trim().is_empty() {
-                        println!("{}{}", role_prefix("assistant", COLOR_GREEN), content);
-                    }
-                }
-                HistoryEntry::Tool { content, .. } => {
-                    print_tool_result(
-                        &normalize_tool_content_for_display(content),
-                        tool_content_success(content),
-                    );
-                }
-            }
-        }
-    }
-
-    fn print_statusline(&self) {
-        print_statusline(
-            &self.config.workspace_root,
-            &self.config.llm.model,
-            self.history.active_token_usage(),
-            self.config.history_token_limit,
-            self.history.total_input_usage(),
-            self.history.total_output_usage(),
-        );
-    }
-
-    fn save_history(&mut self) -> Result<()> {
-        self.history.last_active_at_ms = now_millis();
-        let text =
-            serde_json::to_string_pretty(&self.history).context("failed to encode history")?;
-        fs::write(&self.history_path, text).with_context(|| {
-            format!(
-                "failed to write history file {}",
-                self.history_path.display()
-            )
-        })
-    }
 }
 
 fn parse_shell_tool_args(tool_call: &ToolCall) -> Result<ShellRequest> {
@@ -754,6 +1258,109 @@ where
             tool_call.name, tool_call.arguments
         )
     })
+}
+
+fn parse_reviewer_command(line: &str) -> Option<ReviewerKind> {
+    let mut parts = line.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("/reviewer"), Some("simple"), None) => Some(ReviewerKind::Simple),
+        (Some("/reviewer"), Some("progressive"), None) => Some(ReviewerKind::Progressive),
+        _ => None,
+    }
+}
+
+fn parse_u32_command(line: &str, prefix: &str) -> Option<u32> {
+    let mut parts = line.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(command), Some(value), None) if command == prefix => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn usage_delta(base: &HistoryFile, updated: &HistoryFile) -> (u64, u64, u64) {
+    (
+        updated
+            .total_input_tokens
+            .saturating_sub(base.total_input_tokens),
+        updated
+            .total_output_tokens
+            .saturating_sub(base.total_output_tokens),
+        updated.total_tokens.saturating_sub(base.total_tokens),
+    )
+}
+
+fn simple_review_prompt(id: usize) -> String {
+    format!(
+        concat!(
+            "Review theorem entry {} and try to find an error in its proof.\n",
+            "Use theorem_graph_examine, theorem_graph_list_deps, or some other tools if needed.\n",
+            "If you find an error, call comment exactly once with id={} and a concise description of the flaw, then stop.\n",
+            "If you do not find an error, reply briefly that no error was found."
+        ),
+        id, id
+    )
+}
+
+fn progressive_review_prompts(
+    id: usize,
+    statement: &str,
+    proof: &str,
+    iteration: usize,
+) -> Vec<String> {
+    let proof_chunks = split_proof_into_chunks(
+        proof,
+        2_usize.saturating_pow(iteration as u32),
+        PROGRESSIVE_REVIEW_MIN_CHUNK_LINES,
+    );
+    proof_chunks
+        .into_iter()
+        .map(|chunk| progressive_review_prompt(id, statement, &chunk))
+        .collect()
+}
+
+fn progressive_review_prompt(id: usize, statement: &str, proof_chunk: &str) -> String {
+    format!(
+        concat!(
+            "Please look into the details of these contents in the proof and try to find the potential errors in that proof of theorem entry {}.\n",
+            "The theorem statement is:\n{}\n\n",
+            "Focus on the supplied proof part, inspect the local reasoning carefully, and use theorem_graph_examine, theorem_graph_list_deps, or other tools if needed.\n",
+            "If you find an error, call comment exactly once with id={} and a concise description of the flaw.\n",
+            "If you do not find an error, reply briefly that no error was found.\n\n",
+            "Here is the contents you should examine:\n\n{}"
+        ),
+        id, statement, id, proof_chunk
+    )
+}
+
+fn split_proof_into_chunks(
+    proof: &str,
+    target_chunks: usize,
+    min_chunk_lines: usize,
+) -> Vec<String> {
+    let lines = proof.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return vec![String::new()];
+    }
+
+    let max_chunks = if min_chunk_lines == 0 {
+        target_chunks.max(1)
+    } else {
+        target_chunks
+            .max(1)
+            .min((lines.len() / min_chunk_lines).max(1))
+    };
+    let mut chunks = Vec::with_capacity(max_chunks);
+    let mut start = 0usize;
+
+    for remaining_chunks in (1..=max_chunks).rev() {
+        let remaining_lines = lines.len().saturating_sub(start);
+        let chunk_len = remaining_lines.div_ceil(remaining_chunks).max(1);
+        let end = (start + chunk_len).min(lines.len());
+        chunks.push(lines[start..end].join("\n"));
+        start = end;
+    }
+
+    chunks
 }
 
 fn format_tool_content(command: &str, workdir: &str, success: bool, output: String) -> String {
@@ -1072,13 +1679,34 @@ fn read_env(names: &[&str]) -> Option<String> {
     })
 }
 
-fn print_repl_help(auto_approve: bool, enable_shell: bool, history_path: &Path) {
+fn print_repl_help(
+    auto_approve: bool,
+    enable_shell: bool,
+    reviewer: &ReviewerConfig,
+    history_path: &Path,
+) {
     println!("{}", style(COLOR_BOLD, "interactive help"));
     println!();
     println!("{}", style(COLOR_DIM, "slash commands:"));
     println!(
         "  {}  Retry the previous turn without adding a new user message",
         style(COLOR_DIM, "/continue")
+    );
+    println!(
+        "  {}  Manually trigger a pre-turn history compaction",
+        style(COLOR_DIM, "/compact")
+    );
+    println!(
+        "  {}  Switch reviewer strategy",
+        style(COLOR_DIM, "/reviewer simple|progressive")
+    );
+    println!(
+        "  {}  Set the simple reviewer parallel review count",
+        style(COLOR_DIM, "/reviews <N>")
+    );
+    println!(
+        "  {}  Set the progressive reviewer iteration count",
+        style(COLOR_DIM, "/iterations <N>")
     );
     println!("  {}  Show this help", style(COLOR_DIM, "/help"));
     if enable_shell {
@@ -1113,6 +1741,12 @@ fn print_repl_help(auto_approve: bool, enable_shell: bool, history_path: &Path) 
             }
         );
     }
+    println!("  reviewer: {}", reviewer.description());
+    println!("  simple reviews: {}", reviewer.simple_reviews);
+    println!(
+        "  progressive iterations: {}",
+        reviewer.progressive_iterations
+    );
     println!("  history file: {}", history_path.display());
     println!();
     println!("{}", style(COLOR_DIM, "how to use it:"));
@@ -1126,4 +1760,23 @@ fn print_repl_help(auto_approve: bool, enable_shell: bool, history_path: &Path) 
         println!("  - In ask mode, you can approve or reject each shell command before execution.");
     }
     println!("  - Ctrl-C cancels the current input line; Ctrl-D exits the session.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PROGRESSIVE_REVIEW_MIN_CHUNK_LINES, split_proof_into_chunks};
+
+    #[test]
+    fn split_proof_respects_chunk_count_and_order() {
+        let proof = (1..=10)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let chunks = split_proof_into_chunks(&proof, 4, PROGRESSIVE_REVIEW_MIN_CHUNK_LINES);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "line 1\nline 2\nline 3\nline 4\nline 5");
+        assert_eq!(chunks[1], "line 6\nline 7\nline 8\nline 9\nline 10");
+    }
 }

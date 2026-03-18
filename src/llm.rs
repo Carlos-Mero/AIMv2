@@ -1,12 +1,13 @@
-use crate::ui::{COLOR_YELLOW, print_api_error, style};
+use crate::ui::{COLOR_YELLOW, Spinner, print_api_error, style};
 use anyhow::{Context, Result, bail};
 use async_openai::{
     Client,
     config::OpenAIConfig,
     types::chat::{
         ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
-        ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools, CompletionUsage,
-        CreateChatCompletionRequestArgs, FunctionObject, FunctionType, ReasoningEffort,
+        ChatCompletionRequestMessage, ChatCompletionStreamOptions, ChatCompletionTool,
+        ChatCompletionTools, CompletionUsage, CreateChatCompletionRequestArgs, FunctionObject,
+        FunctionType, ReasoningEffort,
     },
 };
 use futures::StreamExt;
@@ -37,6 +38,11 @@ pub(crate) struct ToolCall {
     pub(crate) arguments: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ToolMode {
+    Agent { enable_shell: bool },
+}
+
 #[derive(Debug, Default)]
 struct PartialToolCall {
     id: String,
@@ -54,39 +60,29 @@ pub(crate) fn build_client(api_key: &str, base_url: &str) -> LlmClient {
 pub(crate) async fn call_model<F>(
     client: &LlmClient,
     config: &LlmConfig,
-    messages: Vec<async_openai::types::chat::ChatCompletionRequestMessage>,
-    enable_tools: bool,
-    enable_shell: bool,
+    messages: Vec<ChatCompletionRequestMessage>,
+    tool_mode: Option<ToolMode>,
+    show_spinner: bool,
     mut on_text: F,
 ) -> Result<LlmReply>
 where
     F: FnMut(&str),
 {
-    let mut request = CreateChatCompletionRequestArgs::default();
-    request.model(&config.model);
-    request.messages(messages);
-    request.reasoning_effort(config.reasoning_effort.clone());
-    request.stream(true);
-    request.stream_options(ChatCompletionStreamOptions {
-        include_usage: Some(true),
-        include_obfuscation: None,
-    });
-
-    if enable_tools {
-        request.tools(tool_definitions(enable_shell));
-        request.parallel_tool_calls(false);
-    }
-
-    let request = request
+    let stream_request = build_request(config, messages.clone(), tool_mode, true)?
         .build()
         .context("failed to build chat completion request")?;
 
     let mut stream = client
         .chat()
-        .create_stream(request)
+        .create_stream(stream_request)
         .await
         .context("chat completion request failed")?;
 
+    let mut spinner = if show_spinner {
+        Some(Spinner::start())
+    } else {
+        None
+    };
     let mut content = String::new();
     let mut refusal = String::new();
     let reasoning: Option<String> = None;
@@ -95,6 +91,9 @@ where
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("failed to receive streaming response chunk")?;
+        if let Some(mut spinner) = spinner.take() {
+            spinner.stop();
+        }
         if let Some(chunk_usage) = chunk.usage {
             usage = Some(chunk_usage);
         }
@@ -114,19 +113,110 @@ where
         }
     }
 
-    let content = if content.trim().is_empty() {
+    let streamed_content = if content.trim().is_empty() {
         refusal.trim().to_string()
     } else {
         content.trim().to_string()
     };
-    let tool_calls = finalize_tool_calls(tool_calls)?;
-    if content.is_empty() && tool_calls.is_empty() {
+    if let Some(mut spinner) = spinner.take() {
+        spinner.stop();
+    }
+    let usage_input = usage.as_ref().map(|usage| u64::from(usage.prompt_tokens));
+    let usage_output = usage
+        .as_ref()
+        .map(|usage| u64::from(usage.completion_tokens));
+    let usage_total = usage.as_ref().map(|usage| u64::from(usage.total_tokens));
+
+    let tool_calls = match finalize_tool_calls(tool_calls) {
+        Ok(tool_calls) => tool_calls,
+        Err(_) if tool_mode.is_some() => {
+            let fallback = fallback_non_stream(client, config, messages, tool_mode).await?;
+            let content = if streamed_content.is_empty() {
+                fallback.content
+            } else {
+                streamed_content.clone()
+            };
+            return Ok(LlmReply {
+                content,
+                reasoning: fallback.reasoning,
+                tool_calls: fallback.tool_calls,
+                input_tokens: fallback.input_tokens.or(usage_input),
+                output_tokens: fallback.output_tokens.or(usage_output),
+                total_tokens: fallback.total_tokens.or(usage_total),
+            });
+        }
+        Err(err) => return Err(err),
+    };
+
+    if streamed_content.is_empty() && tool_calls.is_empty() {
         bail!("model returned neither content nor tool calls");
     }
 
     Ok(LlmReply {
-        content,
+        content: streamed_content,
         reasoning,
+        tool_calls,
+        input_tokens: usage_input,
+        output_tokens: usage_output,
+        total_tokens: usage_total,
+    })
+}
+
+fn build_request(
+    config: &LlmConfig,
+    messages: Vec<ChatCompletionRequestMessage>,
+    tool_mode: Option<ToolMode>,
+    stream: bool,
+) -> Result<CreateChatCompletionRequestArgs> {
+    let mut request = CreateChatCompletionRequestArgs::default();
+    request.model(&config.model);
+    request.messages(messages);
+    request.reasoning_effort(config.reasoning_effort.clone());
+    request.stream(stream);
+    if stream {
+        request.stream_options(ChatCompletionStreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        });
+    }
+    if let Some(mode) = tool_mode {
+        request.tools(tool_definitions(mode));
+        request.parallel_tool_calls(false);
+    }
+    Ok(request)
+}
+
+async fn fallback_non_stream(
+    client: &LlmClient,
+    config: &LlmConfig,
+    messages: Vec<ChatCompletionRequestMessage>,
+    tool_mode: Option<ToolMode>,
+) -> Result<LlmReply> {
+    let request = build_request(config, messages, tool_mode, false)?
+        .build()
+        .context("failed to build fallback chat completion request")?;
+    let response = client
+        .chat()
+        .create(request)
+        .await
+        .context("fallback chat completion request failed")?;
+    let choice = response
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("fallback model response missing choices[0]"))?;
+    let message = choice.message;
+    let content = message
+        .content
+        .or(message.refusal)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let tool_calls = extract_tool_calls(message.tool_calls)?;
+    let usage = response.usage;
+    Ok(LlmReply {
+        content,
+        reasoning: None,
         tool_calls,
         input_tokens: usage.as_ref().map(|usage| u64::from(usage.prompt_tokens)),
         output_tokens: usage
@@ -136,19 +226,24 @@ where
     })
 }
 
-fn tool_definitions(enable_shell: bool) -> Vec<ChatCompletionTools> {
-    let mut tools = vec![
-        theorem_graph_push_tool_definition(),
-        theorem_graph_list_tool_definition(),
-        theorem_graph_list_deps_tool_definition(),
-        theorem_graph_examine_tool_definition(),
-        theorem_graph_review_tool_definition(),
-        theorem_graph_revise_tool_definition(),
-    ];
-    if enable_shell {
-        tools.push(shell_tool_definition());
+fn tool_definitions(mode: ToolMode) -> Vec<ChatCompletionTools> {
+    match mode {
+        ToolMode::Agent { enable_shell } => {
+            let mut tools = vec![
+                theorem_graph_push_tool_definition(),
+                theorem_graph_list_tool_definition(),
+                theorem_graph_list_deps_tool_definition(),
+                theorem_graph_examine_tool_definition(),
+                theorem_graph_review_tool_definition(),
+                theorem_graph_revise_tool_definition(),
+                theorem_graph_comment_tool_definition(),
+            ];
+            if enable_shell {
+                tools.push(shell_tool_definition());
+            }
+            tools
+        }
     }
-    tools
 }
 
 fn shell_tool_definition() -> ChatCompletionTools {
@@ -320,6 +415,30 @@ fn theorem_graph_revise_tool_definition() -> ChatCompletionTools {
                     }
                 },
                 "required": ["id", "proof", "dependencies"],
+                "additionalProperties": false
+            })),
+            strict: Some(true),
+        },
+    })
+}
+
+fn theorem_graph_comment_tool_definition() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "comment".to_string(),
+            description: Some(
+                "Append a reviewer comment to an existing theorem entry after detecting a proof error.".to_string(),
+            ),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "minimum": 0},
+                    "comment": {
+                        "type": "string",
+                        "description": "A concise description of the proof error that was found."
+                    }
+                },
+                "required": ["id", "comment"],
                 "additionalProperties": false
             })),
             strict: Some(true),

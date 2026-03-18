@@ -4,8 +4,6 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
 
-const PENDING_REVIEW_COMMENT: &str = "Pending review due to flaws in dependencies";
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TheoremEntryType {
@@ -107,7 +105,7 @@ impl TheoremGraph {
     }
 
     pub(crate) fn path_to(&self, id: usize) -> Result<String> {
-        let ids = self.review_scope(id)?;
+        let ids = self.path_scope(id)?;
         let mut out = Vec::with_capacity(ids.len());
         for theorem_id in ids {
             out.push(format_entry_full(self.entry(theorem_id)?));
@@ -115,26 +113,32 @@ impl TheoremGraph {
         Ok(out.join("\n\n"))
     }
 
-    pub(crate) fn review(&mut self, id: usize) -> Result<String> {
-        let review_order = self.review_scope(id)?;
-        let mut reviewed = Vec::new();
-        for theorem_id in review_order {
-            let (passed, comments, review_count) = self.review_entry(theorem_id)?;
-            {
-                let entry = self.entry_mut(theorem_id)?;
-                entry.reviews = entry.reviews.saturating_add(review_count);
-                if passed {
-                    entry.comments = None;
-                    reviewed.push(theorem_id);
-                    continue;
-                }
-                entry.comments = comments;
-            }
-            self.mark_pending_derivations(theorem_id);
-            reviewed.push(theorem_id);
+    pub(crate) fn entry_snapshot(&self, id: usize) -> Result<TheoremEntry> {
+        Ok(self.entry(id)?.clone())
+    }
+
+    pub(crate) fn add_reviews(&mut self, id: usize, review_count: u32) -> Result<u32> {
+        let entry = self.entry_mut(id)?;
+        entry.reviews = entry.reviews.saturating_add(review_count);
+        Ok(entry.reviews)
+    }
+
+    pub(crate) fn append_comment(&mut self, id: usize, comment: impl AsRef<str>) -> Result<String> {
+        let entry = self.entry_mut(id)?;
+        let comment = comment.as_ref().trim();
+        if comment.is_empty() {
+            bail!("comment cannot be empty");
         }
 
-        Ok(format!("reviewed theorem entries {:?}", reviewed))
+        match &mut entry.comments {
+            Some(existing) if !existing.trim().is_empty() => {
+                existing.push_str("\n");
+                existing.push_str(comment);
+            }
+            slot => *slot = Some(comment.to_string()),
+        }
+
+        Ok(format!("comment added to theorem entry {id}"))
     }
 
     pub(crate) fn revise(
@@ -170,11 +174,10 @@ impl TheoremGraph {
         entry.comments = None;
         entry.reviews = 0;
 
-        self.clear_pending_derivations(id);
         Ok(format!("revised theorem entry {id}"))
     }
 
-    fn review_scope(&self, id: usize) -> Result<Vec<usize>> {
+    fn path_scope(&self, id: usize) -> Result<Vec<usize>> {
         let mut seen = BTreeSet::new();
         let mut queue = VecDeque::from([id]);
         while let Some(current) = queue.pop_front() {
@@ -187,51 +190,6 @@ impl TheoremGraph {
             }
         }
         Ok(seen.into_iter().collect())
-    }
-
-    fn mark_pending_derivations(&mut self, id: usize) {
-        let mut queue: VecDeque<usize> = self.entries[id].derivations.iter().copied().collect();
-        let mut seen = BTreeSet::new();
-        while let Some(current) = queue.pop_front() {
-            if !seen.insert(current) {
-                continue;
-            }
-            let entry = &mut self.entries[current];
-            if entry.comments.is_none() {
-                entry.comments = Some(PENDING_REVIEW_COMMENT.to_string());
-            }
-            for derivation in entry.derivations.clone() {
-                queue.push_back(derivation);
-            }
-        }
-    }
-
-    fn clear_pending_derivations(&mut self, id: usize) {
-        let mut queue: VecDeque<usize> = self.entries[id].derivations.iter().copied().collect();
-        let mut seen = BTreeSet::new();
-        while let Some(current) = queue.pop_front() {
-            if !seen.insert(current) {
-                continue;
-            }
-            let entry = &mut self.entries[current];
-            match entry.comments.as_deref() {
-                Some(PENDING_REVIEW_COMMENT) => {
-                    entry.comments = None;
-                    for derivation in entry.derivations.clone() {
-                        queue.push_back(derivation);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn review_entry(&self, id: usize) -> Result<(bool, Option<String>, u32)> {
-        let entry = self.entry(id)?;
-        match entry.entry_type {
-            TheoremEntryType::Context => Ok((true, None, 0)),
-            TheoremEntryType::Theorem => Ok((true, None, 1)),
-        }
     }
 
     fn validate_new_dependencies(
@@ -376,5 +334,34 @@ mod tests {
         assert_eq!(graph.entries[2].dependencies, vec![1]);
         assert_eq!(graph.entries[2].reviews, 0);
         assert!(graph.entries[2].comments.is_none());
+    }
+
+    #[test]
+    fn append_comment_preserves_existing_comments() {
+        let mut graph = TheoremGraph::default();
+        graph
+            .push(TheoremEntryType::Theorem, "A", "proof", vec![])
+            .unwrap();
+
+        graph.append_comment(0, "first issue").unwrap();
+        graph.append_comment(0, "second issue").unwrap();
+
+        assert_eq!(
+            graph.entries[0].comments.as_deref(),
+            Some("first issue\nsecond issue")
+        );
+    }
+
+    #[test]
+    fn add_reviews_accumulates_review_count() {
+        let mut graph = TheoremGraph::default();
+        graph
+            .push(TheoremEntryType::Theorem, "A", "proof", vec![])
+            .unwrap();
+
+        let total = graph.add_reviews(0, 4).unwrap();
+
+        assert_eq!(total, 4);
+        assert_eq!(graph.entries[0].reviews, 4);
     }
 }

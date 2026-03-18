@@ -16,7 +16,7 @@ const COMPACTION_TRIGGER_NUMERATOR: u64 = 4;
 const COMPACTION_TRIGGER_DENOMINATOR: u64 = 5;
 const HISTORY_SUMMARY_PREFIX: &str = "[history summary]";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HistoryFile {
     pub(crate) version: u32,
     pub(crate) session_id: String,
@@ -171,6 +171,18 @@ impl HistoryFile {
         self.total_output_tokens
     }
 
+    pub(crate) fn apply_usage_delta(&mut self, delta: (u64, u64, u64)) {
+        let (input_delta, output_delta, total_delta) = delta;
+        self.total_input_tokens = self.total_input_tokens.saturating_add(input_delta);
+        self.total_output_tokens = self.total_output_tokens.saturating_add(output_delta);
+        self.total_tokens = if total_delta == 0 {
+            self.total_input_tokens
+                .saturating_add(self.total_output_tokens)
+        } else {
+            self.total_tokens.saturating_add(total_delta)
+        };
+    }
+
     pub(crate) fn needs_compaction(&self, token_limit: u64) -> bool {
         self.active_token_usage()
             >= token_limit.saturating_mul(COMPACTION_TRIGGER_NUMERATOR)
@@ -216,6 +228,28 @@ impl HistoryFile {
         self.entries
             .iter()
             .rposition(|entry| matches!(entry, HistoryEntry::System { .. }))
+    }
+
+    pub(crate) fn clone_at_model_boundary(&self) -> Self {
+        let mut cloned = self.clone();
+        let Some(last_assistant_index) = cloned.entries.iter().rposition(|entry| {
+            matches!(
+                entry,
+                HistoryEntry::Assistant { tool_calls, .. } if !tool_calls.is_empty()
+            )
+        }) else {
+            return cloned;
+        };
+
+        let trailing_entries = &cloned.entries[last_assistant_index + 1..];
+        if trailing_entries
+            .iter()
+            .all(|entry| matches!(entry, HistoryEntry::Tool { .. }))
+        {
+            cloned.entries.truncate(last_assistant_index);
+        }
+
+        cloned
     }
 }
 
@@ -311,14 +345,14 @@ pub(crate) fn build_messages(
     workspace_root: &Path,
     entries: &[HistoryEntry],
     enable_shell: bool,
-    minimal_reviews: u32,
+    reviewer_description: &str,
 ) -> Vec<ChatCompletionRequestMessage> {
     let mut messages = vec![
         ChatCompletionRequestSystemMessage {
             content: ChatCompletionRequestSystemMessageContent::Text(system_prompt(
                 workspace_root,
                 enable_shell,
-                minimal_reviews,
+                reviewer_description,
             )),
             name: None,
         }
@@ -482,7 +516,7 @@ fn text_weight(text: &str) -> u64 {
     text.split_whitespace().count().max(1) as u64
 }
 
-fn system_prompt(workspace_root: &Path, enable_shell: bool, minimal_reviews: u32) -> String {
+fn system_prompt(workspace_root: &Path, enable_shell: bool, reviewer_description: &str) -> String {
     let mut prompt = format!(
         concat!(
             "You are AIM, an AI mathematician working inside a local workspace.\n",
@@ -495,15 +529,17 @@ fn system_prompt(workspace_root: &Path, enable_shell: bool, minimal_reviews: u32
             "Create a context entry when you receive important mathematical information from the user or obtain it from local files, web search, or other external resources. Record that context before using it in later deductions, and use the proof field to note the source or provenance.\n",
             "Create a theorem entry only for important lemmas or theorems that you deduce yourself.\n",
             "Use theorem_graph_list or theorem_graph_list_deps to review existing theorem-graph results when you need to reconnect the proof path.\n",
-            "Before claiming a final result, call theorem_graph_review on the final theorem. If flaws are reported, inspect them with theorem_graph_list_deps and theorem_graph_examine, then repair the proof path.\n",
+            "Before claiming a final result, call theorem_graph_review on the final theorem at least once. If flaws are reported, inspect them with theorem_graph_list_deps and theorem_graph_examine, then repair the proof path.\n",
+            "If you detect a proof error in an existing theorem, use comment to append a concise reviewer note to that theorem entry.\n",
             "If a flawed theorem can be fixed without changing its statement, use theorem_graph_revise. Otherwise, create a new theorem entry and rebuild the downstream derivation path.\n",
-            "Only claim that the problem is solved when you have a desired final theorem and every theorem-type dependency in its proof path has at least {} reviews. Context entries are treated as trusted references and do not need reviews.\n",
+            "Only claim that the problem is solved when you have a desired final theorem, the final theorem has been reviewed at least once, and there are no known errors anywhere in its proof path.\n",
+            "Current reviewer configuration: {}.\n",
             "When replying to the user, summarize the core ideas and the key theorem-graph results rather than reproducing every proof detail in chat.\n",
             "Keep responses concise, but include enough detail to make the mathematics defensible.\n",
             "If the request of the user does not require theorem graph or other tools, you can also answer directly."
         ),
         workspace_root.display(),
-        minimal_reviews
+        reviewer_description
     );
 
     if enable_shell {

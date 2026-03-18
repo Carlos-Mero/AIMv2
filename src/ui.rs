@@ -77,6 +77,22 @@ pub fn print_api_error(message: &str) {
     );
 }
 
+pub fn print_background_wait(message: &str) {
+    println!(
+        "{} {}",
+        style(COLOR_DIM, "status>"),
+        fold_for_display(message)
+    );
+}
+
+pub fn print_background_error(message: &str) {
+    println!(
+        "{} {}",
+        style(COLOR_RED, "background error>"),
+        fold_for_display(message)
+    );
+}
+
 pub fn print_tool_call(command: &str, workdir: &str) {
     let prefix = format!("{} ", style(COLOR_CYAN, "tool[shell]>"));
     let message = format!("{command}\n(cwd: {workdir})");
@@ -84,6 +100,15 @@ pub fn print_tool_call(command: &str, workdir: &str) {
         "{}{}",
         prefix,
         fold_lines_for_display(&message, MAX_TOOL_CALL_PREVIEW_LINES)
+    );
+}
+
+pub fn print_named_tool_call(tool_name: &str, content: &str) {
+    let prefix = format!("{} ", style(COLOR_CYAN, &format!("tool[{tool_name}]>")));
+    println!(
+        "{}{}",
+        prefix,
+        fold_lines_for_display(content, MAX_TOOL_CALL_PREVIEW_LINES)
     );
 }
 
