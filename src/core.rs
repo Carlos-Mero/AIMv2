@@ -1,5 +1,6 @@
 mod history;
 mod llm;
+mod prompt;
 mod theorem_graph;
 mod ui;
 
@@ -13,6 +14,7 @@ use history::{
     token_limit_for_model,
 };
 use llm::{LlmConfig, ToolCall, ToolMode, build_client, call_model, report_api_error};
+use prompt::{progressive_review_prompt, simple_review_prompt};
 use serde::Deserialize;
 use std::env;
 use std::fs;
@@ -581,7 +583,7 @@ impl App {
         let mut sub_session = self.session.spawn_subsession(false, false);
         sub_session
             .history
-            .push_user(self.session.history.compaction_prompt(mode));
+            .push_user(prompt::compaction_prompt(mode));
         let base_history = self.session.history.clone();
         if self.session.emit_output {
             print_background_wait("waiting for background compaction session to complete");
@@ -806,7 +808,7 @@ impl Session {
         let mut sub_session = self.spawn_subsession(false, false);
         sub_session
             .history
-            .push_user(self.history.compaction_prompt(mode));
+            .push_user(prompt::compaction_prompt(mode));
         if self.emit_output {
             print_background_wait("waiting for background compaction session to complete");
         }
@@ -1289,18 +1291,6 @@ fn usage_delta(base: &HistoryFile, updated: &HistoryFile) -> (u64, u64, u64) {
     )
 }
 
-fn simple_review_prompt(id: usize) -> String {
-    format!(
-        concat!(
-            "Review theorem entry {} and try to find an error in its proof.\n",
-            "Use theorem_graph_examine, theorem_graph_list_deps, or some other tools if needed.\n",
-            "If you find an error, call comment exactly once with id={} and a concise description of the flaw, then stop.\n",
-            "If you do not find an error, reply briefly that no error was found."
-        ),
-        id, id
-    )
-}
-
 fn progressive_review_prompts(
     id: usize,
     statement: &str,
@@ -1316,20 +1306,6 @@ fn progressive_review_prompts(
         .into_iter()
         .map(|chunk| progressive_review_prompt(id, statement, &chunk))
         .collect()
-}
-
-fn progressive_review_prompt(id: usize, statement: &str, proof_chunk: &str) -> String {
-    format!(
-        concat!(
-            "Please look into the details of these contents in the proof and try to find the potential errors in that proof of theorem entry {}.\n",
-            "The theorem statement is:\n{}\n\n",
-            "Focus on the supplied proof part, inspect the local reasoning carefully, and use theorem_graph_examine, theorem_graph_list_deps, or other tools if needed.\n",
-            "If you find an error, call comment exactly once with id={} and a concise description of the flaw.\n",
-            "If you do not find an error, reply briefly that no error was found.\n\n",
-            "Here is the contents you should examine:\n\n{}"
-        ),
-        id, statement, id, proof_chunk
-    )
 }
 
 fn split_proof_into_chunks(
