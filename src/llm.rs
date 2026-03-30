@@ -140,9 +140,9 @@ where
                 content,
                 reasoning: fallback.reasoning,
                 tool_calls: fallback.tool_calls,
-                input_tokens: fallback.input_tokens.or(usage_input),
-                output_tokens: fallback.output_tokens.or(usage_output),
-                total_tokens: fallback.total_tokens.or(usage_total),
+                input_tokens: sum_token_usage(usage_input, fallback.input_tokens),
+                output_tokens: sum_token_usage(usage_output, fallback.output_tokens),
+                total_tokens: sum_token_usage(usage_total, fallback.total_tokens),
             });
         }
         Err(err) => return Err(err),
@@ -537,6 +537,27 @@ fn validate_tool_call_arguments(tool_name: &str, arguments: &str) -> Result<()> 
     serde_json::from_str::<Value>(trimmed)
         .with_context(|| format!("tool {tool_name} arguments are not valid JSON: {trimmed}"))?;
     Ok(())
+}
+
+fn sum_token_usage(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sum_token_usage;
+
+    #[test]
+    fn sums_usage_across_stream_and_fallback_requests() {
+        assert_eq!(sum_token_usage(Some(12), Some(8)), Some(20));
+        assert_eq!(sum_token_usage(Some(12), None), Some(12));
+        assert_eq!(sum_token_usage(None, Some(8)), Some(8));
+        assert_eq!(sum_token_usage(None, None), None);
+    }
 }
 
 pub(crate) fn report_api_error(err: &anyhow::Error) {

@@ -134,12 +134,8 @@ impl HistoryFile {
         let start = self.last_system_index().unwrap_or(0);
         let entry_count = self.entries[start..].len() as u64;
         let entry_estimate = estimate_entry_tokens(&self.entries, start);
-        let resolved_input = input_tokens.or_else(|| {
-            total_tokens.and_then(|total| output_tokens.map(|output| total.saturating_sub(output)))
-        });
-        let resolved_output = output_tokens.or_else(|| {
-            total_tokens.and_then(|total| resolved_input.map(|input| total.saturating_sub(input)))
-        });
+        let (resolved_input, resolved_output, resolved_total) =
+            resolve_usage(input_tokens, output_tokens, total_tokens);
 
         self.total_input_tokens = self
             .total_input_tokens
@@ -148,10 +144,16 @@ impl HistoryFile {
             .total_output_tokens
             .saturating_add(resolved_output.unwrap_or(0));
         self.total_tokens = self
-            .total_input_tokens
-            .saturating_add(self.total_output_tokens);
+            .total_tokens
+            .saturating_add(resolved_total.unwrap_or_else(|| {
+                resolved_input
+                    .unwrap_or(0)
+                    .saturating_add(resolved_output.unwrap_or(0))
+            }));
 
-        let active_estimate = resolved_input.unwrap_or_else(|| entry_estimate.max(entry_count));
+        let active_estimate = resolved_input
+            .or(resolved_total)
+            .unwrap_or_else(|| entry_estimate.max(entry_count));
         apply_estimated_tokens(&mut self.entries, start, active_estimate);
     }
 
@@ -175,12 +177,9 @@ impl HistoryFile {
         let (input_delta, output_delta, total_delta) = delta;
         self.total_input_tokens = self.total_input_tokens.saturating_add(input_delta);
         self.total_output_tokens = self.total_output_tokens.saturating_add(output_delta);
-        self.total_tokens = if total_delta == 0 {
-            self.total_input_tokens
-                .saturating_add(self.total_output_tokens)
-        } else {
-            self.total_tokens.saturating_add(total_delta)
-        };
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(total_delta.max(input_delta.saturating_add(output_delta)));
     }
 
     pub(crate) fn needs_compaction(&self, token_limit: u64) -> bool {
@@ -496,4 +495,105 @@ fn distribute_tokens(entries: &mut [HistoryEntry], delta: u64) {
 
 fn text_weight(text: &str) -> u64 {
     text.split_whitespace().count().max(1) as u64
+}
+
+fn resolve_usage(
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let resolved_input = input_tokens.or_else(|| {
+        total_tokens.and_then(|total| output_tokens.map(|output| total.saturating_sub(output)))
+    });
+    let resolved_output = output_tokens.or_else(|| {
+        total_tokens.and_then(|total| resolved_input.map(|input| total.saturating_sub(input)))
+    });
+    let resolved_total = total_tokens.or_else(|| {
+        Some(
+            resolved_input
+                .unwrap_or(0)
+                .saturating_add(resolved_output.unwrap_or(0)),
+        )
+    });
+    (resolved_input, resolved_output, resolved_total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HistoryEntry, HistoryFile};
+
+    fn history_with_user() -> HistoryFile {
+        let mut history = HistoryFile {
+            version: 1,
+            session_id: "session".to_string(),
+            workspace_root: ".".to_string(),
+            last_active_at_ms: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_tokens: 0,
+            theorem_graph: Default::default(),
+            entries: Vec::new(),
+        };
+        history.push_user("test prompt".to_string());
+        history
+    }
+
+    #[test]
+    fn note_api_usage_preserves_reported_total_without_split() {
+        let mut history = history_with_user();
+
+        history.note_api_usage(None, None, Some(42));
+
+        assert_eq!(history.total_input_tokens, 0);
+        assert_eq!(history.total_output_tokens, 0);
+        assert_eq!(history.total_tokens, 42);
+        assert_eq!(history.active_token_usage(), 42);
+    }
+
+    #[test]
+    fn note_api_usage_derives_missing_output_from_total() {
+        let mut history = history_with_user();
+
+        history.note_api_usage(Some(30), None, Some(45));
+
+        assert_eq!(history.total_input_tokens, 30);
+        assert_eq!(history.total_output_tokens, 15);
+        assert_eq!(history.total_tokens, 45);
+    }
+
+    #[test]
+    fn apply_usage_delta_keeps_explicit_total_delta() {
+        let mut history = history_with_user();
+        history.total_tokens = 10;
+
+        history.apply_usage_delta((0, 0, 7));
+
+        assert_eq!(history.total_tokens, 17);
+    }
+
+    #[test]
+    fn apply_usage_delta_uses_visible_split_when_total_delta_is_missing() {
+        let mut history = history_with_user();
+
+        history.apply_usage_delta((11, 13, 0));
+
+        assert_eq!(history.total_input_tokens, 11);
+        assert_eq!(history.total_output_tokens, 13);
+        assert_eq!(history.total_tokens, 24);
+    }
+
+    #[test]
+    fn note_api_usage_reweights_active_entries() {
+        let mut history = history_with_user();
+        history.push_assistant("reply".to_string(), None, Vec::new());
+
+        history.note_api_usage(Some(60), Some(20), Some(80));
+
+        let active_total = history
+            .entries
+            .iter()
+            .map(HistoryEntry::estimated_tokens)
+            .sum::<u64>();
+        assert_eq!(active_total, 60);
+    }
 }
