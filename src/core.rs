@@ -33,7 +33,7 @@ use ui::{
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-5.4";
-const LOOP_LIMIT: usize = 64;
+const LOOP_LIMIT: usize = 1000000;
 const PROGRESSIVE_REVIEW_MIN_CHUNK_LINES: usize = 4;
 
 #[derive(Parser, Debug)]
