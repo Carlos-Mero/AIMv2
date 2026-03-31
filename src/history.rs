@@ -30,7 +30,22 @@ pub(crate) struct HistoryFile {
     pub(crate) total_tokens: u64,
     #[serde(default)]
     pub(crate) theorem_graph: TheoremGraph,
+    #[serde(default)]
+    pub(crate) session_config: Option<SessionConfigSnapshot>,
     pub(crate) entries: Vec<HistoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SessionConfigSnapshot {
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: String,
+    pub(crate) base_url: String,
+    pub(crate) history_token_limit: u64,
+    pub(crate) reviewer_kind: String,
+    pub(crate) simple_reviews: u32,
+    pub(crate) progressive_iterations: u32,
+    pub(crate) enable_shell: bool,
+    pub(crate) auto_approve: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,6 +547,7 @@ mod tests {
             total_output_tokens: 0,
             total_tokens: 0,
             theorem_graph: Default::default(),
+            session_config: None,
             entries: Vec::new(),
         };
         history.push_user("test prompt".to_string());

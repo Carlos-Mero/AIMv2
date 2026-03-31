@@ -10,8 +10,8 @@ use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::future::try_join_all;
 use history::{
-    AssistantToolCall, CompactionMode, HistoryEntry, HistoryFile, build_messages,
-    token_limit_for_model,
+    AssistantToolCall, CompactionMode, HistoryEntry, HistoryFile, SessionConfigSnapshot,
+    build_messages, token_limit_for_model,
 };
 use llm::{LlmConfig, ToolCall, ToolMode, build_client, call_model, report_api_error};
 use prompt::{progressive_review_prompt, simple_review_prompt};
@@ -162,6 +162,7 @@ impl From<CliReasoningEffort> for ReasoningEffort {
 #[derive(Clone, Debug)]
 struct Config {
     llm: LlmConfig,
+    base_url: String,
     history_token_limit: u64,
     reviewer: ReviewerConfig,
     workspace_root: PathBuf,
@@ -256,6 +257,40 @@ struct ReviewerConfig {
     progressive_iterations: u32,
 }
 
+impl Config {
+    fn snapshot(&self, auto_approve: bool) -> SessionConfigSnapshot {
+        SessionConfigSnapshot {
+            model: self.llm.model.clone(),
+            reasoning_effort: reasoning_effort_label(&self.llm.reasoning_effort).to_string(),
+            base_url: self.base_url.clone(),
+            history_token_limit: self.history_token_limit,
+            reviewer_kind: reviewer_kind_label(self.reviewer.kind).to_string(),
+            simple_reviews: self.reviewer.simple_reviews,
+            progressive_iterations: self.reviewer.progressive_iterations,
+            enable_shell: self.enable_shell,
+            auto_approve,
+        }
+    }
+
+    fn from_snapshot(snapshot: &SessionConfigSnapshot, workspace_root: PathBuf) -> Result<Self> {
+        Ok(Self {
+            llm: LlmConfig {
+                model: snapshot.model.clone(),
+                reasoning_effort: parse_reasoning_effort(&snapshot.reasoning_effort)?,
+            },
+            base_url: snapshot.base_url.clone(),
+            history_token_limit: snapshot.history_token_limit.max(1),
+            reviewer: ReviewerConfig {
+                kind: parse_reviewer_kind(&snapshot.reviewer_kind)?,
+                simple_reviews: snapshot.simple_reviews.max(1),
+                progressive_iterations: snapshot.progressive_iterations.max(1),
+            },
+            workspace_root,
+            enable_shell: snapshot.enable_shell,
+        })
+    }
+}
+
 impl ReviewerConfig {
     fn active_label(&self) -> &'static str {
         match self.kind {
@@ -275,6 +310,44 @@ impl ReviewerConfig {
                 self.progressive_iterations
             ),
         }
+    }
+}
+
+fn reasoning_effort_label(value: &ReasoningEffort) -> &'static str {
+    match value {
+        ReasoningEffort::None => "none",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(ReasoningEffort::None),
+        "minimal" => Ok(ReasoningEffort::Minimal),
+        "low" => Ok(ReasoningEffort::Low),
+        "medium" => Ok(ReasoningEffort::Medium),
+        "high" => Ok(ReasoningEffort::High),
+        "xhigh" => Ok(ReasoningEffort::Xhigh),
+        other => bail!("unsupported saved reasoning effort: {other}"),
+    }
+}
+
+fn reviewer_kind_label(value: ReviewerKind) -> &'static str {
+    match value {
+        ReviewerKind::Simple => "simple",
+        ReviewerKind::Progressive => "progressive",
+    }
+}
+
+fn parse_reviewer_kind(value: &str) -> Result<ReviewerKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "simple" => Ok(ReviewerKind::Simple),
+        "progressive" => Ok(ReviewerKind::Progressive),
+        other => bail!("unsupported saved reviewer kind: {other}"),
     }
 }
 
@@ -333,31 +406,17 @@ impl App {
             .ok_or_else(|| anyhow!("missing AIM_API_KEY or OPENAI_API_KEY"))?;
         let base_url = read_env(&["AIM_BASE_URL", "OPENAI_BASE_URL"])
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let history_token_limit = cli
-            .token_limit
-            .unwrap_or_else(|| token_limit_for_model(&cli.model));
-        let explicit_log_path = resolve_log_path(&workspace_root, cli.log_path)?;
-        let config = Config {
-            llm: LlmConfig {
-                model: cli.model,
-                reasoning_effort: cli.reasoning_effort.into(),
-            },
-            history_token_limit,
-            reviewer: ReviewerConfig {
-                kind: cli.reviewer,
-                simple_reviews: cli.simple_reviews,
-                progressive_iterations: cli.progressive_iterations,
-            },
-            workspace_root: workspace_root.clone(),
-            enable_shell: cli.enable_shell,
-        };
+        let explicit_log_path = resolve_log_path(&workspace_root, cli.log_path.clone())?;
         let (history_path, history) =
             load_or_create_session(&workspace_root, explicit_log_path.as_deref(), resume)?;
+        let fallback_config = config_from_cli(&cli, workspace_root.clone(), base_url);
+        let (config, auto_approve) =
+            resolve_session_settings(&history, resume, fallback_config, cli.auto)?;
 
         let theorem_graph = Arc::new(AsyncMutex::new(history.theorem_graph.clone()));
-        let auto_approve = Arc::new(Mutex::new(cli.auto));
+        let auto_approve = Arc::new(Mutex::new(auto_approve));
         let session = Session {
-            client: build_client(&api_key, &base_url),
+            client: build_client(&api_key, &config.base_url),
             config,
             theorem_graph,
             history,
@@ -690,6 +749,7 @@ impl Session {
         let mut snapshot = self.history.clone();
         snapshot.last_active_at_ms = now_millis();
         snapshot.theorem_graph = self.theorem_graph.lock().await.clone();
+        snapshot.session_config = Some(self.config.snapshot(self.auto_approve()));
         snapshot
     }
 
@@ -1399,6 +1459,46 @@ fn resolve_workdir(workspace_root: &Path, requested: Option<&str>) -> Result<Pat
     Ok(candidate)
 }
 
+fn config_from_cli(cli: &Cli, workspace_root: PathBuf, base_url: String) -> Config {
+    let history_token_limit = cli
+        .token_limit
+        .unwrap_or_else(|| token_limit_for_model(&cli.model));
+    Config {
+        llm: LlmConfig {
+            model: cli.model.clone(),
+            reasoning_effort: cli.reasoning_effort.into(),
+        },
+        base_url,
+        history_token_limit,
+        reviewer: ReviewerConfig {
+            kind: cli.reviewer,
+            simple_reviews: cli.simple_reviews,
+            progressive_iterations: cli.progressive_iterations,
+        },
+        workspace_root,
+        enable_shell: cli.enable_shell,
+    }
+}
+
+fn resolve_session_settings(
+    history: &HistoryFile,
+    resume: ResumeMode,
+    fallback_config: Config,
+    fallback_auto_approve: bool,
+) -> Result<(Config, bool)> {
+    if matches!(resume, ResumeMode::New) {
+        return Ok((fallback_config, fallback_auto_approve));
+    }
+
+    match history.session_config.as_ref() {
+        Some(snapshot) => Ok((
+            Config::from_snapshot(snapshot, fallback_config.workspace_root.clone())?,
+            snapshot.auto_approve,
+        )),
+        None => Ok((fallback_config, fallback_auto_approve)),
+    }
+}
+
 fn load_or_create_session(
     workspace_root: &Path,
     explicit_log_path: Option<&Path>,
@@ -1407,7 +1507,7 @@ fn load_or_create_session(
     match resume {
         ResumeMode::New => {
             let history = HistoryFile {
-                version: 6,
+                version: 7,
                 session_id: format!("session-{}-{}", now_millis(), std::process::id()),
                 workspace_root: workspace_root.display().to_string(),
                 last_active_at_ms: now_millis(),
@@ -1415,6 +1515,7 @@ fn load_or_create_session(
                 total_output_tokens: 0,
                 total_tokens: 0,
                 theorem_graph: theorem_graph::TheoremGraph::default(),
+                session_config: None,
                 entries: Vec::new(),
             };
             let path = match explicit_log_path {
@@ -1783,7 +1884,14 @@ fn print_repl_help(
 
 #[cfg(test)]
 mod tests {
-    use super::{PROGRESSIVE_REVIEW_MIN_CHUNK_LINES, split_proof_into_chunks};
+    use super::{
+        Config, PROGRESSIVE_REVIEW_MIN_CHUNK_LINES, ResumeMode, ReviewerConfig, ReviewerKind,
+        SessionConfigSnapshot, resolve_session_settings, split_proof_into_chunks,
+    };
+    use crate::history::HistoryFile;
+    use crate::llm::LlmConfig;
+    use async_openai::types::chat::ReasoningEffort;
+    use std::path::PathBuf;
 
     #[test]
     fn split_proof_respects_chunk_count_and_order() {
@@ -1797,5 +1905,100 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0], "line 1\nline 2\nline 3\nline 4\nline 5");
         assert_eq!(chunks[1], "line 6\nline 7\nline 8\nline 9\nline 10");
+    }
+
+    #[test]
+    fn resolve_session_settings_prefers_saved_resume_config() {
+        let workspace_root = PathBuf::from("/tmp/workspace");
+        let fallback = fallback_config(workspace_root.clone());
+        let history = HistoryFile {
+            version: 7,
+            session_id: "session".to_string(),
+            workspace_root: workspace_root.display().to_string(),
+            last_active_at_ms: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_tokens: 0,
+            theorem_graph: Default::default(),
+            session_config: Some(SessionConfigSnapshot {
+                model: "gpt-5.4-mini".to_string(),
+                reasoning_effort: "high".to_string(),
+                base_url: "https://example.invalid/v1".to_string(),
+                history_token_limit: 2048,
+                reviewer_kind: "simple".to_string(),
+                simple_reviews: 6,
+                progressive_iterations: 9,
+                enable_shell: true,
+                auto_approve: true,
+            }),
+            entries: Vec::new(),
+        };
+
+        let (config, auto_approve) =
+            resolve_session_settings(&history, ResumeMode::Last, fallback, false).unwrap();
+
+        assert_eq!(config.llm.model, "gpt-5.4-mini");
+        assert!(matches!(config.llm.reasoning_effort, ReasoningEffort::High));
+        assert_eq!(config.base_url, "https://example.invalid/v1");
+        assert_eq!(config.history_token_limit, 2048);
+        assert_eq!(config.reviewer.kind, ReviewerKind::Simple);
+        assert_eq!(config.reviewer.simple_reviews, 6);
+        assert_eq!(config.reviewer.progressive_iterations, 9);
+        assert!(config.enable_shell);
+        assert!(auto_approve);
+    }
+
+    #[test]
+    fn resolve_session_settings_uses_fallback_for_legacy_resume_logs() {
+        let workspace_root = PathBuf::from("/tmp/workspace");
+        let fallback = fallback_config(workspace_root.clone());
+        let history = HistoryFile {
+            version: 6,
+            session_id: "session".to_string(),
+            workspace_root: workspace_root.display().to_string(),
+            last_active_at_ms: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_tokens: 0,
+            theorem_graph: Default::default(),
+            session_config: None,
+            entries: Vec::new(),
+        };
+
+        let (config, auto_approve) =
+            resolve_session_settings(&history, ResumeMode::Select, fallback.clone(), true).unwrap();
+
+        assert_eq!(config.llm.model, fallback.llm.model);
+        assert!(matches!(
+            config.llm.reasoning_effort,
+            ReasoningEffort::Medium
+        ));
+        assert_eq!(config.base_url, fallback.base_url);
+        assert_eq!(config.history_token_limit, fallback.history_token_limit);
+        assert_eq!(config.reviewer.kind, fallback.reviewer.kind);
+        assert_eq!(
+            config.reviewer.progressive_iterations,
+            fallback.reviewer.progressive_iterations
+        );
+        assert_eq!(config.enable_shell, fallback.enable_shell);
+        assert!(auto_approve);
+    }
+
+    fn fallback_config(workspace_root: PathBuf) -> Config {
+        Config {
+            llm: LlmConfig {
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: ReasoningEffort::Medium,
+            },
+            base_url: "https://api.openai.com/v1".to_string(),
+            history_token_limit: 1_000_000,
+            reviewer: ReviewerConfig {
+                kind: ReviewerKind::Progressive,
+                simple_reviews: 4,
+                progressive_iterations: 3,
+            },
+            workspace_root,
+            enable_shell: false,
+        }
     }
 }
