@@ -12,6 +12,7 @@ use std::path::Path;
 
 const DEFAULT_TOKEN_LIMIT: u64 = 128 * 1024;
 const GPT5_TOKEN_LIMIT: u64 = 1_000_000;
+const GEMINI3_TOKEN_LIMIT: u64 = 1_000_000;
 const COMPACTION_TRIGGER_NUMERATOR: u64 = 4;
 const COMPACTION_TRIGGER_DENOMINATOR: u64 = 5;
 const HISTORY_SUMMARY_PREFIX: &str = "[history summary]";
@@ -449,6 +450,8 @@ pub(crate) fn token_limit_for_model(model: &str) -> u64 {
     let normalized = model.trim().to_ascii_lowercase();
     if normalized.starts_with("gpt-5") {
         GPT5_TOKEN_LIMIT
+    } else if normalized.starts_with("gemini-3") {
+        GEMINI3_TOKEN_LIMIT
     } else {
         DEFAULT_TOKEN_LIMIT
     }
