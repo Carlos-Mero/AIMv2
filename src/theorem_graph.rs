@@ -435,12 +435,7 @@ mod tests {
     fn markdown_output_does_not_wrap_proof_or_comments_in_text_fences() {
         let mut graph = TheoremGraph::default();
         graph
-            .push(
-                TheoremEntryType::Theorem,
-                "A",
-                "line 1\nline 2",
-                vec![],
-            )
+            .push(TheoremEntryType::Theorem, "A", "line 1\nline 2", vec![])
             .unwrap();
         graph.append_comment(0, "review note").unwrap();
 

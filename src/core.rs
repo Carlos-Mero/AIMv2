@@ -103,7 +103,7 @@ struct Cli {
         long,
         global = true,
         value_name = "FILE",
-        help = "Path to the session log file; relative paths are resolved from the current workspace"
+        help = "Path to the session log file to load or write; relative paths are resolved from the current workspace"
     )]
     log_path: Option<PathBuf>,
 
@@ -117,7 +117,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CliCommand {
-    /// Resume a saved session for the current workspace.
+    /// Resume a saved session. By default, sessions are discovered for the current workspace.
     Resume {
         #[arg(
             long,
@@ -1556,7 +1556,7 @@ fn load_or_create_session(
         }
         ResumeMode::Last | ResumeMode::Select if explicit_log_path.is_some() => {
             let path = explicit_log_path.expect("checked is_some");
-            let history = load_session_file(path, workspace_root)?;
+            let history = load_session_file(path)?;
             Ok((path.to_path_buf(), history))
         }
         ResumeMode::Last => {
@@ -1650,20 +1650,11 @@ fn list_sessions(workspace_root: &Path) -> Result<Vec<SessionSummary>> {
     Ok(sessions)
 }
 
-fn load_session_file(path: &Path, workspace_root: &Path) -> Result<HistoryFile> {
+fn load_session_file(path: &Path) -> Result<HistoryFile> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read session log {}", path.display()))?;
-    let history: HistoryFile = serde_json::from_str(&text)
-        .with_context(|| format!("failed to decode session log {}", path.display()))?;
-    let workspace_key = workspace_root.display().to_string();
-    if history.workspace_root != workspace_key {
-        bail!(
-            "session log {} belongs to a different workspace: {}",
-            path.display(),
-            history.workspace_root
-        );
-    }
-    Ok(history)
+    serde_json::from_str(&text)
+        .with_context(|| format!("failed to decode session log {}", path.display()))
 }
 
 fn load_history_from_path(path: &Path) -> Result<HistoryFile> {
@@ -1929,14 +1920,14 @@ fn print_repl_help(
 mod tests {
     use super::{
         Config, PROGRESSIVE_REVIEW_MIN_CHUNK_LINES, ResumeMode, ReviewerConfig, ReviewerKind,
-        SessionConfigSnapshot, build_view_save_hint, resolve_session_settings,
+        SessionConfigSnapshot, build_view_save_hint, load_session_file, resolve_session_settings,
         split_proof_into_chunks,
     };
     use crate::history::HistoryFile;
     use crate::llm::LlmConfig;
     use async_openai::types::chat::ReasoningEffort;
     use clap::Parser;
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
     #[test]
     fn split_proof_respects_chunk_count_and_order() {
@@ -2036,6 +2027,41 @@ mod tests {
         let hint = build_view_save_hint(&cli);
 
         assert!(hint.contains("aimv2 view --last --all > theorem-graph.md"));
+    }
+
+    #[test]
+    fn load_session_file_allows_cross_workspace_resume() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aimv2-test-{}-{}",
+            std::process::id(),
+            super::now_millis()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let log_path = temp_dir.join("foreign-session.json");
+        let foreign_workspace = temp_dir.join("other-workspace");
+        let history = HistoryFile {
+            version: 7,
+            session_id: "session".to_string(),
+            workspace_root: foreign_workspace.display().to_string(),
+            last_active_at_ms: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_tokens: 0,
+            theorem_graph: Default::default(),
+            session_config: None,
+            entries: Vec::new(),
+        };
+        fs::write(&log_path, serde_json::to_string(&history).unwrap()).unwrap();
+
+        let loaded = load_session_file(&log_path).unwrap();
+
+        assert_eq!(
+            loaded.workspace_root,
+            foreign_workspace.display().to_string()
+        );
+
+        let _ = fs::remove_file(&log_path);
+        let _ = fs::remove_dir(&temp_dir);
     }
 
     fn fallback_config(workspace_root: PathBuf) -> Config {
