@@ -11,7 +11,7 @@ use async_openai::{
     },
 };
 use futures::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 #[derive(Clone, Debug)]
 pub(crate) struct LlmConfig {
@@ -35,7 +35,7 @@ pub(crate) struct LlmReply {
 pub(crate) struct ToolCall {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) arguments: String,
+    pub(crate) arguments: Value,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -492,12 +492,12 @@ fn finalize_tool_calls(tool_calls: Vec<PartialToolCall>) -> Result<Vec<ToolCall>
                 call.id
             );
         }
-        validate_tool_call_arguments(&call.name, &call.arguments)
+        let arguments = validate_tool_call_arguments(&call.name, &call.arguments)
             .with_context(|| format!("tool call {} has malformed JSON arguments", call.id))?;
         finalized.push(ToolCall {
             id: call.id,
             name: call.name,
-            arguments: call.arguments,
+            arguments,
         });
     }
     Ok(finalized)
@@ -511,14 +511,15 @@ fn extract_tool_calls(
     for tool_call in tool_calls.unwrap_or_default() {
         match tool_call {
             ChatCompletionMessageToolCalls::Function(call) => {
-                validate_tool_call_arguments(&call.function.name, &call.function.arguments)
-                    .with_context(|| {
-                        format!("tool call {} has malformed JSON arguments", call.id)
-                    })?;
+                let arguments =
+                    validate_tool_call_arguments(&call.function.name, &call.function.arguments)
+                        .with_context(|| {
+                            format!("tool call {} has malformed JSON arguments", call.id)
+                        })?;
                 parsed.push(ToolCall {
                     id: call.id,
                     name: call.function.name,
-                    arguments: call.function.arguments,
+                    arguments,
                 });
             }
             ChatCompletionMessageToolCalls::Custom(call) => {
@@ -529,14 +530,41 @@ fn extract_tool_calls(
     Ok(parsed)
 }
 
-fn validate_tool_call_arguments(tool_name: &str, arguments: &str) -> Result<()> {
+fn validate_tool_call_arguments(tool_name: &str, arguments: &str) -> Result<Value> {
     let trimmed = arguments.trim();
     if trimmed.is_empty() {
         bail!("tool {tool_name} returned empty arguments");
     }
-    serde_json::from_str::<Value>(trimmed)
+    let value = serde_json::from_str::<Value>(trimmed)
         .with_context(|| format!("tool {tool_name} arguments are not valid JSON: {trimmed}"))?;
-    Ok(())
+    match value {
+        Value::Object(_) => Ok(value),
+        other => bail!(
+            "tool {tool_name} arguments must decode to a JSON object, got {}",
+            json_type_name(&other)
+        ),
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+pub(crate) fn tool_arguments_as_object(arguments: &Value) -> Result<Map<String, Value>> {
+    match arguments {
+        Value::Object(map) => Ok(map.clone()),
+        other => bail!(
+            "tool arguments must be a JSON object, got {}",
+            json_type_name(other)
+        ),
+    }
 }
 
 fn sum_token_usage(left: Option<u64>, right: Option<u64>) -> Option<u64> {

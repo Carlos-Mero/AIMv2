@@ -8,6 +8,7 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContent, FunctionCall,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::Path;
 
 const DEFAULT_TOKEN_LIMIT: u64 = 128 * 1024;
@@ -86,7 +87,8 @@ pub(crate) enum HistoryEntry {
 pub(crate) struct AssistantToolCall {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) arguments: String,
+    #[serde(deserialize_with = "deserialize_tool_arguments")]
+    pub(crate) arguments: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,7 +278,7 @@ impl HistoryEntry {
                 let tool_call_weight = match self {
                     Self::Assistant { tool_calls, .. } => tool_calls
                         .iter()
-                        .map(|call| text_weight(&call.name) + text_weight(&call.arguments))
+                        .map(|call| text_weight(&call.name) + json_value_weight(&call.arguments))
                         .sum(),
                     _ => 0,
                 };
@@ -408,7 +410,10 @@ pub(crate) fn build_messages(
                                         id: call.id.clone(),
                                         function: FunctionCall {
                                             name: call.name.clone(),
-                                            arguments: call.arguments.clone(),
+                                            arguments: serde_json::to_string(&call.arguments)
+                                                .expect(
+                                                    "assistant tool call arguments must serialize",
+                                                ),
                                         },
                                     },
                                 )
@@ -515,6 +520,51 @@ fn text_weight(text: &str) -> u64 {
     text.split_whitespace().count().max(1) as u64
 }
 
+fn json_value_weight(value: &Value) -> u64 {
+    text_weight(&value.to_string())
+}
+
+fn deserialize_tool_arguments<'de, D>(deserializer: D) -> Result<Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RawToolArguments {
+        Encoded(String),
+        Json(Value),
+    }
+
+    match RawToolArguments::deserialize(deserializer)? {
+        RawToolArguments::Json(Value::Object(map)) => Ok(Value::Object(map)),
+        RawToolArguments::Json(other) => Err(serde::de::Error::custom(format!(
+            "tool arguments must be a JSON object, got {}",
+            json_type_name(&other)
+        ))),
+        RawToolArguments::Encoded(text) => {
+            let value: Value = serde_json::from_str(&text).map_err(serde::de::Error::custom)?;
+            match value {
+                Value::Object(map) => Ok(Value::Object(map)),
+                other => Err(serde::de::Error::custom(format!(
+                    "tool arguments must decode to a JSON object, got {}",
+                    json_type_name(&other)
+                ))),
+            }
+        }
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn resolve_usage(
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -538,7 +588,8 @@ fn resolve_usage(
 
 #[cfg(test)]
 mod tests {
-    use super::{HistoryEntry, HistoryFile};
+    use super::{AssistantToolCall, HistoryEntry, HistoryFile};
+    use serde_json::json;
 
     fn history_with_user() -> HistoryFile {
         let mut history = HistoryFile {
@@ -614,5 +665,29 @@ mod tests {
             .map(HistoryEntry::estimated_tokens)
             .sum::<u64>();
         assert_eq!(active_total, 60);
+    }
+
+    #[test]
+    fn assistant_tool_call_accepts_legacy_stringified_arguments() {
+        let call: AssistantToolCall = serde_json::from_value(json!({
+            "id": "call_1",
+            "name": "shell_tool",
+            "arguments": "{\"command\":\"pwd\"}"
+        }))
+        .unwrap();
+
+        assert_eq!(call.arguments, json!({ "command": "pwd" }));
+    }
+
+    #[test]
+    fn assistant_tool_call_serializes_arguments_as_json_object() {
+        let call = AssistantToolCall {
+            id: "call_1".to_string(),
+            name: "shell_tool".to_string(),
+            arguments: json!({ "command": "pwd" }),
+        };
+
+        let encoded = serde_json::to_value(&call).unwrap();
+        assert_eq!(encoded["arguments"], json!({ "command": "pwd" }));
     }
 }

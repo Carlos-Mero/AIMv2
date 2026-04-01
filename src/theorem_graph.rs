@@ -309,9 +309,9 @@ fn format_entry_markdown(entry: &TheoremEntry) -> String {
             "### Statement\n\n",
             "{}\n\n",
             "### Proof\n\n",
-            "```text\n{}\n```\n\n",
+            "{}\n\n",
             "### Comments\n\n",
-            "```text\n{}\n```"
+            "{}"
         ),
         entry.id,
         format_entry_type(&entry.entry_type),
@@ -429,5 +429,25 @@ mod tests {
 
         assert!(markdown.starts_with("# Theorem Graph"));
         assert!(entry_0 < entry_1);
+    }
+
+    #[test]
+    fn markdown_output_does_not_wrap_proof_or_comments_in_text_fences() {
+        let mut graph = TheoremGraph::default();
+        graph
+            .push(
+                TheoremEntryType::Theorem,
+                "A",
+                "line 1\nline 2",
+                vec![],
+            )
+            .unwrap();
+        graph.append_comment(0, "review note").unwrap();
+
+        let markdown = graph.examine_markdown(0).unwrap();
+
+        assert!(!markdown.contains("```text"));
+        assert!(markdown.contains("### Proof\n\nline 1\nline 2"));
+        assert!(markdown.contains("### Comments\n\nreview note"));
     }
 }

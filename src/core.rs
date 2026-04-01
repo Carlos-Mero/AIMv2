@@ -13,9 +13,13 @@ use history::{
     AssistantToolCall, CompactionMode, HistoryEntry, HistoryFile, SessionConfigSnapshot,
     build_messages, token_limit_for_model,
 };
-use llm::{LlmConfig, ToolCall, ToolMode, build_client, call_model, report_api_error};
+use llm::{
+    LlmConfig, ToolCall, ToolMode, build_client, call_model, report_api_error,
+    tool_arguments_as_object,
+};
 use prompt::{progressive_review_prompt, simple_review_prompt};
 use serde::Deserialize;
+use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -1332,12 +1336,18 @@ fn parse_tool_args<T>(tool_call: &ToolCall) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_json::from_str(&tool_call.arguments).with_context(|| {
+    let object = tool_arguments_as_object(&tool_call.arguments)?;
+    serde_json::from_value::<T>(Value::Object(object)).with_context(|| {
         format!(
             "failed to decode arguments for tool {}: {}",
-            tool_call.name, tool_call.arguments
+            tool_call.name,
+            render_tool_arguments(&tool_call.arguments)
         )
     })
+}
+
+fn render_tool_arguments(arguments: &Value) -> String {
+    serde_json::to_string(arguments).unwrap_or_else(|_| "<unserializable json>".to_string())
 }
 
 fn parse_reviewer_command(line: &str) -> Option<ReviewerKind> {
