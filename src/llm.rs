@@ -425,7 +425,7 @@ fn theorem_graph_revise_tool_definition() -> ChatCompletionTools {
 fn theorem_graph_comment_tool_definition() -> ChatCompletionTools {
     ChatCompletionTools::Function(ChatCompletionTool {
         function: FunctionObject {
-            name: "comment".to_string(),
+            name: "theorem_graph_comment".to_string(),
             description: Some(
                 "Append a reviewer comment to an existing theorem entry after detecting a proof error.".to_string(),
             ),

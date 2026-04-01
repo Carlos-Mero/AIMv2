@@ -108,6 +108,14 @@ impl TheoremGraph {
         Ok(format_entry_markdown(self.entry(id)?))
     }
 
+    pub(crate) fn all_markdown(&self) -> String {
+        let mut out = vec!["# Theorem Graph".to_string()];
+        for entry in &self.entries {
+            out.push(format_entry_markdown(entry));
+        }
+        out.join("\n\n")
+    }
+
     pub(crate) fn path_to(&self, id: usize) -> Result<String> {
         let ids = self.path_scope(id)?;
         let mut out = Vec::with_capacity(ids.len());
@@ -403,5 +411,23 @@ mod tests {
 
         assert_eq!(total, 4);
         assert_eq!(graph.entries[0].reviews, 4);
+    }
+
+    #[test]
+    fn all_markdown_lists_entries_in_id_order() {
+        let mut graph = TheoremGraph::default();
+        graph
+            .push(TheoremEntryType::Context, "A", "ref", vec![])
+            .unwrap();
+        graph
+            .push(TheoremEntryType::Theorem, "B", "proof", vec![0])
+            .unwrap();
+
+        let markdown = graph.all_markdown();
+        let entry_0 = markdown.find("## Entry 0").unwrap();
+        let entry_1 = markdown.find("## Entry 1").unwrap();
+
+        assert!(markdown.starts_with("# Theorem Graph"));
+        assert!(entry_0 < entry_1);
     }
 }

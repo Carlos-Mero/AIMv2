@@ -127,16 +127,22 @@ enum CliCommand {
         last: bool,
         #[arg(
             long,
-            conflicts_with = "path_to",
+            conflicts_with_all = ["path_to", "all"],
             help = "Print one theorem entry by id"
         )]
         id: Option<usize>,
         #[arg(
             long = "path-to",
-            conflicts_with = "id",
+            conflicts_with_all = ["id", "all"],
             help = "Print one theorem entry and all of its dependencies"
         )]
         path_to: Option<usize>,
+        #[arg(
+            long,
+            conflicts_with_all = ["id", "path_to"],
+            help = "Print all theorem-graph entries in id order"
+        )]
+        all: bool,
     },
 }
 
@@ -180,6 +186,7 @@ struct Session {
     config: Config,
     theorem_graph: Arc<AsyncMutex<theorem_graph::TheoremGraph>>,
     history: HistoryFile,
+    history_path: Option<Arc<PathBuf>>,
     auto_approve: Arc<Mutex<bool>>,
     allow_auto_compaction: bool,
     emit_output: bool,
@@ -420,6 +427,7 @@ impl App {
             config,
             theorem_graph,
             history,
+            history_path: Some(Arc::new(history_path.clone())),
             auto_approve,
             allow_auto_compaction: true,
             emit_output: true,
@@ -707,14 +715,7 @@ impl App {
     }
 
     async fn save_history(&mut self) -> Result<()> {
-        let snapshot = self.session.snapshot_history().await;
-        let text = serde_json::to_string_pretty(&snapshot).context("failed to encode history")?;
-        fs::write(&self.history_path, text).with_context(|| {
-            format!(
-                "failed to write history file {}",
-                self.history_path.display()
-            )
-        })
+        self.session.persist_history().await
     }
 }
 
@@ -739,6 +740,7 @@ impl Session {
             config: self.config.clone(),
             theorem_graph: Arc::clone(&self.theorem_graph),
             history: self.history.clone_at_model_boundary(),
+            history_path: None,
             auto_approve: Arc::clone(&self.auto_approve),
             allow_auto_compaction,
             emit_output,
@@ -751,6 +753,17 @@ impl Session {
         snapshot.theorem_graph = self.theorem_graph.lock().await.clone();
         snapshot.session_config = Some(self.config.snapshot(self.auto_approve()));
         snapshot
+    }
+
+    async fn persist_history(&self) -> Result<()> {
+        let Some(history_path) = &self.history_path else {
+            return Ok(());
+        };
+
+        let snapshot = self.snapshot_history().await;
+        let text = serde_json::to_string_pretty(&snapshot).context("failed to encode history")?;
+        fs::write(history_path.as_ref(), text)
+            .with_context(|| format!("failed to write history file {}", history_path.display()))
     }
 
     async fn run_agent_loop(&mut self, mode: SessionMode) -> Result<SessionOutcome> {
@@ -826,6 +839,7 @@ impl Session {
                 reply.reasoning.clone(),
                 assistant_tool_calls,
             );
+            self.persist_history().await?;
 
             if reply.tool_calls.is_empty() {
                 return Ok(SessionOutcome {
@@ -963,14 +977,16 @@ impl Session {
                         ),
                     }
                 }
-                "comment" => match self.handle_theorem_graph_comment(&tool_call).await {
-                    Ok(content) => (true, content, ReviewRunOutcome::Commented),
-                    Err(err) => (
-                        false,
-                        format!("tool error: {err:#}"),
-                        ReviewRunOutcome::NoError,
-                    ),
-                },
+                "theorem_graph_comment" => {
+                    match self.handle_theorem_graph_comment(&tool_call).await {
+                        Ok(content) => (true, content, ReviewRunOutcome::Commented),
+                        Err(err) => (
+                            false,
+                            format!("tool error: {err:#}"),
+                            ReviewRunOutcome::NoError,
+                        ),
+                    }
+                }
                 "theorem_graph_revise" => {
                     match self.handle_theorem_graph_revise(&tool_call).await {
                         Ok(content) => (true, content, ReviewRunOutcome::NoError),
@@ -998,6 +1014,7 @@ impl Session {
             }
             self.history
                 .push_tool(tool_call.id, tool_call.name, content);
+            self.persist_history().await?;
             if matches!(current_review_outcome, ReviewRunOutcome::Commented) {
                 review_outcome = ReviewRunOutcome::Commented;
             }
@@ -1071,7 +1088,7 @@ impl Session {
         let args: TheoremGraphCommentArgs = parse_tool_args(tool_call)?;
         if self.emit_output {
             print_named_tool_call(
-                "comment",
+                "theorem_graph_comment",
                 &format!(
                     "id: {}\ncomment: {}",
                     args.id,
@@ -1649,7 +1666,12 @@ fn load_history_from_path(path: &Path) -> Result<HistoryFile> {
 fn run_view(cli: &Cli) -> Result<()> {
     let workspace_root = env::current_dir().context("failed to determine current directory")?;
     let explicit_log_path = resolve_log_path(&workspace_root, cli.log_path.clone())?;
-    let CliCommand::View { last, id, path_to } = cli
+    let CliCommand::View {
+        last,
+        id,
+        path_to,
+        all,
+    } = cli
         .command
         .as_ref()
         .ok_or_else(|| anyhow!("view command missing"))?
@@ -1669,11 +1691,12 @@ fn run_view(cli: &Cli) -> Result<()> {
         (None, false) => bail!("view requires --log-path <FILE> or --last"),
     };
 
-    let output = match (id, path_to) {
-        (Some(id), None) => history.theorem_graph.examine_markdown(*id)?,
-        (None, Some(id)) => history.theorem_graph.path_to_markdown(*id)?,
-        (None, None) => bail!("view requires exactly one of --id or --path-to"),
-        (Some(_), Some(_)) => bail!("view accepts only one of --id or --path-to"),
+    let output = match (id, path_to, *all) {
+        (Some(id), None, false) => history.theorem_graph.examine_markdown(*id)?,
+        (None, Some(id), false) => history.theorem_graph.path_to_markdown(*id)?,
+        (None, None, true) => history.theorem_graph.all_markdown(),
+        (None, None, false) => bail!("view requires exactly one of --id, --path-to, or --all"),
+        _ => bail!("view accepts only one of --id, --path-to, or --all"),
     };
 
     eprintln!("{}", build_view_save_hint(cli));
@@ -1692,7 +1715,13 @@ fn build_view_save_hint(cli: &Cli) -> String {
         command.push_str(" --last");
     }
 
-    if let Some(CliCommand::View { last, id, path_to }) = &cli.command {
+    if let Some(CliCommand::View {
+        last,
+        id,
+        path_to,
+        all,
+    }) = &cli.command
+    {
         if *last && cli.log_path.is_none() {
             command = String::from("aimv2 view --last");
         }
@@ -1703,6 +1732,10 @@ fn build_view_save_hint(cli: &Cli) -> String {
         if let Some(id) = path_to {
             command.push_str(&format!(" --path-to {id}"));
             command.push_str(&format!(" > theorem-path-{id}.md"));
+        }
+        if *all {
+            command.push_str(" --all");
+            command.push_str(" > theorem-graph.md");
         }
     }
 
@@ -1886,11 +1919,13 @@ fn print_repl_help(
 mod tests {
     use super::{
         Config, PROGRESSIVE_REVIEW_MIN_CHUNK_LINES, ResumeMode, ReviewerConfig, ReviewerKind,
-        SessionConfigSnapshot, resolve_session_settings, split_proof_into_chunks,
+        SessionConfigSnapshot, build_view_save_hint, resolve_session_settings,
+        split_proof_into_chunks,
     };
     use crate::history::HistoryFile;
     use crate::llm::LlmConfig;
     use async_openai::types::chat::ReasoningEffort;
+    use clap::Parser;
     use std::path::PathBuf;
 
     #[test]
@@ -1982,6 +2017,15 @@ mod tests {
         );
         assert_eq!(config.enable_shell, fallback.enable_shell);
         assert!(auto_approve);
+    }
+
+    #[test]
+    fn build_view_save_hint_supports_all_output() {
+        let cli = super::Cli::parse_from(["aimv2", "view", "--last", "--all"]);
+
+        let hint = build_view_save_hint(&cli);
+
+        assert!(hint.contains("aimv2 view --last --all > theorem-graph.md"));
     }
 
     fn fallback_config(workspace_root: PathBuf) -> Config {

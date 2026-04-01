@@ -38,7 +38,7 @@ pub(crate) fn system_prompt(
             "Create a theorem entry only for important lemmas or theorems that you deduce yourself.\n",
             "Use theorem_graph_list or theorem_graph_list_deps to review existing theorem-graph results when you need to reconnect the proof path.\n",
             "Before claiming a final result, call theorem_graph_review on the final theorem at least once. If flaws are reported, inspect them with theorem_graph_list_deps and theorem_graph_examine, then repair the proof path.\n",
-            "If you detect a proof error in an existing theorem, use comment to append a concise reviewer note to that theorem entry.\n",
+            "If you detect a proof error in an existing theorem, use theorem_graph_comment to append a concise reviewer note to that theorem entry.\n",
             "If a flawed theorem can be fixed without changing its statement, use theorem_graph_revise. Otherwise, create a new theorem entry and rebuild the downstream derivation path.\n",
             "Only claim that the problem is solved when you have a desired final theorem, the final theorem has been reviewed at least once, and there are no known errors anywhere in its proof path.\n",
             "Current reviewer configuration: {}.\n",
@@ -71,7 +71,7 @@ pub(crate) fn simple_review_prompt(id: usize) -> String {
         concat!(
             "Review theorem entry {} and try to find an error in its proof.\n",
             "{}",
-            "If you find an error, call comment exactly once with id={} and a concise description of the flaw, then stop.\n",
+            "If you find an error, call theorem_graph_comment exactly once with id={} and a concise description of the flaw, then stop.\n",
             "If you do not find an error, reply briefly that no error was found."
         ),
         id,
@@ -87,7 +87,7 @@ pub(crate) fn progressive_review_prompt(id: usize, statement: &str, proof_chunk:
             "The theorem statement is:\n{}\n\n",
             "Focus on the supplied proof part, but judge whether it is valid in the context of the whole theorem.\n",
             "{}",
-            "If you find an error, call comment exactly once with id={} and a concise description of the flaw.\n",
+            "If you find an error, call theorem_graph_comment exactly once with id={} and a concise description of the flaw.\n",
             "If you do not find an error, reply briefly that no error was found.\n\n",
             "Here is the contents you should examine:\n\n{}"
         ),
