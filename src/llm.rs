@@ -91,19 +91,18 @@ where
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("failed to receive streaming response chunk")?;
-        if let Some(mut spinner) = spinner.take() {
-            spinner.stop();
-        }
         if let Some(chunk_usage) = chunk.usage {
             usage = Some(chunk_usage);
         }
 
         for choice in chunk.choices {
             if let Some(text) = choice.delta.content {
+                stop_spinner(&mut spinner);
                 on_text(&text);
                 content.push_str(&text);
             }
             if let Some(text) = choice.delta.refusal {
+                stop_spinner(&mut spinner);
                 on_text(&text);
                 refusal.push_str(&text);
             }
@@ -131,6 +130,10 @@ where
         Ok(tool_calls) => tool_calls,
         Err(_) if tool_mode.is_some() => {
             let fallback = fallback_non_stream(client, config, messages, tool_mode).await?;
+            if streamed_content.is_empty() && !fallback.content.is_empty() {
+                stop_spinner(&mut spinner);
+                on_text(&fallback.content);
+            }
             let content = if streamed_content.is_empty() {
                 fallback.content
             } else {
@@ -149,7 +152,22 @@ where
     };
 
     if streamed_content.is_empty() && tool_calls.is_empty() {
-        bail!("model returned neither content nor tool calls");
+        let fallback = fallback_non_stream(client, config, messages, tool_mode).await?;
+        if !fallback.content.is_empty() {
+            stop_spinner(&mut spinner);
+            on_text(&fallback.content);
+        }
+        if fallback.content.trim().is_empty() && fallback.tool_calls.is_empty() {
+            bail!("model returned neither content nor tool calls");
+        }
+        return Ok(LlmReply {
+            content: fallback.content,
+            reasoning: fallback.reasoning,
+            tool_calls: fallback.tool_calls,
+            input_tokens: sum_token_usage(usage_input, fallback.input_tokens),
+            output_tokens: sum_token_usage(usage_output, fallback.output_tokens),
+            total_tokens: sum_token_usage(usage_total, fallback.total_tokens),
+        });
     }
 
     Ok(LlmReply {
@@ -575,9 +593,16 @@ fn sum_token_usage(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+fn stop_spinner(spinner: &mut Option<Spinner>) {
+    if let Some(mut spinner) = spinner.take() {
+        spinner.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sum_token_usage;
+    use super::{stop_spinner, sum_token_usage};
+    use crate::ui::Spinner;
 
     #[test]
     fn sums_usage_across_stream_and_fallback_requests() {
@@ -585,6 +610,15 @@ mod tests {
         assert_eq!(sum_token_usage(Some(12), None), Some(12));
         assert_eq!(sum_token_usage(None, Some(8)), Some(8));
         assert_eq!(sum_token_usage(None, None), None);
+    }
+
+    #[test]
+    fn stop_spinner_consumes_spinner_once() {
+        let mut spinner = Some(Spinner::start());
+        stop_spinner(&mut spinner);
+        assert!(spinner.is_none());
+        stop_spinner(&mut spinner);
+        assert!(spinner.is_none());
     }
 }
 
