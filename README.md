@@ -66,6 +66,26 @@ If you want shell commands to run without interactive confirmation:
 aimv2 --enable-shell --auto
 ```
 
+## Skills
+
+Minimal Agent Skills support is available when the shell tool is enabled. On startup, `aimv2` scans these locations for skill folders that contain a `SKILL.md` file:
+
+- `<project>/.aim/skills/`
+- `<project>/.agents/skills/`
+- `~/.aim/skills/`
+- `~/.agents/skills/`
+
+Each discovered skill is loaded from the heading and leading description in `SKILL.md`, and those metadata are injected into the system prompt so the agent can choose and use the skill.
+
+Skills are not loaded unless `--enable-shell` is active, because the prompt instructions tell the agent to read `SKILL.md` through the shell tool when a skill applies.
+
+You can also add extra scan roots with `--external-skills`:
+
+```bash
+aimv2 --enable-shell --external-skills /path/to/skills
+aimv2 --enable-shell --external-skills /path/to/team-skills --external-skills /path/to/private-skills
+```
+
 ## CLI Examples
 
 Start a new interactive session:
