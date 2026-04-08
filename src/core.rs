@@ -1,6 +1,7 @@
 mod history;
 mod llm;
 mod prompt;
+mod skills;
 mod theorem_graph;
 mod ui;
 
@@ -20,6 +21,7 @@ use llm::{
 use prompt::{progressive_review_prompt, simple_review_prompt};
 use serde::Deserialize;
 use serde_json::Value;
+use skills::{SkillMetadata, discover_skills};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -113,6 +115,13 @@ struct Cli {
         help = "Enable the optional shell tool for workspace inspection, editing, and experiments"
     )]
     enable_shell: bool,
+
+    #[arg(
+        long = "external-skills",
+        value_name = "DIR",
+        help = "Additional skill root directory to scan for skill folders; can be passed multiple times"
+    )]
+    external_skills: Vec<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -177,6 +186,7 @@ struct Config {
     reviewer: ReviewerConfig,
     workspace_root: PathBuf,
     enable_shell: bool,
+    skills: Vec<SkillMetadata>,
 }
 
 struct App {
@@ -298,6 +308,7 @@ impl Config {
             },
             workspace_root,
             enable_shell: snapshot.enable_shell,
+            skills: Vec::new(),
         })
     }
 }
@@ -421,8 +432,11 @@ impl App {
         let (history_path, history) =
             load_or_create_session(&workspace_root, explicit_log_path.as_deref(), resume)?;
         let fallback_config = config_from_cli(&cli, workspace_root.clone(), base_url);
-        let (config, auto_approve) =
+        let (mut config, auto_approve) =
             resolve_session_settings(&history, resume, fallback_config, cli.auto)?;
+        if config.enable_shell {
+            config.skills = discover_skills(&workspace_root, &cli.external_skills)?;
+        }
 
         let theorem_graph = Arc::new(AsyncMutex::new(history.theorem_graph.clone()));
         let auto_approve = Arc::new(Mutex::new(auto_approve));
@@ -489,6 +503,13 @@ impl App {
                 style(COLOR_DIM, "disabled")
             }
         );
+        if self.session.config.enable_shell {
+            println!(
+                "{} {}",
+                style(COLOR_DIM, "skills:"),
+                self.session.config.skills.len()
+            );
+        }
         println!(
             "{} {}",
             style(COLOR_DIM, "session:"),
@@ -780,6 +801,7 @@ impl Session {
                 &self.config.workspace_root,
                 &self.history.entries,
                 self.config.enable_shell,
+                &self.config.skills,
                 &self.config.reviewer.description(),
             );
             let mut started_stream = false;
@@ -1504,6 +1526,7 @@ fn config_from_cli(cli: &Cli, workspace_root: PathBuf, base_url: String) -> Conf
         },
         workspace_root,
         enable_shell: cli.enable_shell,
+        skills: Vec::new(),
     }
 }
 
@@ -2079,6 +2102,7 @@ mod tests {
             },
             workspace_root,
             enable_shell: false,
+            skills: Vec::new(),
         }
     }
 }

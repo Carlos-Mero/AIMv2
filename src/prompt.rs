@@ -1,4 +1,5 @@
 use crate::history::CompactionMode;
+use crate::skills::{SkillMetadata, render_skills_section};
 use std::path::Path;
 
 pub(crate) fn compaction_prompt(mode: CompactionMode) -> String {
@@ -22,6 +23,7 @@ pub(crate) fn compaction_prompt(mode: CompactionMode) -> String {
 pub(crate) fn system_prompt(
     workspace_root: &Path,
     enable_shell: bool,
+    skills: &[SkillMetadata],
     reviewer_description: &str,
 ) -> String {
     let mut prompt = format!(
@@ -61,6 +63,12 @@ pub(crate) fn system_prompt(
                 "Before a tool call, usually send a short preamble describing what you are about to do.\n"
             ),
         );
+
+        if let Some(skills_section) = render_skills_section(skills) {
+            prompt.push('\n');
+            prompt.push('\n');
+            prompt.push_str(&skills_section);
+        }
     }
 
     prompt

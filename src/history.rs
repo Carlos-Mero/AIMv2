@@ -1,4 +1,4 @@
-use crate::{prompt, theorem_graph::TheoremGraph};
+use crate::{prompt, skills::SkillMetadata, theorem_graph::TheoremGraph};
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
@@ -344,6 +344,7 @@ pub(crate) fn build_messages(
     workspace_root: &Path,
     entries: &[HistoryEntry],
     enable_shell: bool,
+    skills: &[SkillMetadata],
     reviewer_description: &str,
 ) -> Vec<ChatCompletionRequestMessage> {
     let mut messages = vec![
@@ -351,6 +352,7 @@ pub(crate) fn build_messages(
             content: ChatCompletionRequestSystemMessageContent::Text(prompt::system_prompt(
                 workspace_root,
                 enable_shell,
+                skills,
                 reviewer_description,
             )),
             name: None,
